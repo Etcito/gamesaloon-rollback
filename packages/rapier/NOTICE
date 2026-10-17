@@ -1,0 +1,13 @@
+@gamesaloon/rollback-rapier
+Copyright (c) GameSaloon contributors. Licensed under the MIT License (see repository LICENSE).
+
+Derived from / informed by:
+
+- Sketchbook (https://github.com/swift502/Sketchbook), Copyright (c) swift502, MIT License.
+  The snapshot / restore pattern (World.takeSnapshot, World.restoreSnapshot, FNV-1a state
+  checksum, re-linking bodies after a restore) was learned from Sketchbook's rollback
+  implementation and rewritten as a standalone adapter. No files were copied.
+
+- Rapier (https://rapier.rs), Copyright (c) dimforge, Apache License 2.0.
+  This package depends on @dimforge/rapier3d-deterministic-compat and wraps its public API
+  (World.takeSnapshot / World.restoreSnapshot). Rapier is not bundled in this package.
