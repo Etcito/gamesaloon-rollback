@@ -1,0 +1,204 @@
+# ETCITO LICENSE
+
+**Version 1.0 — DRAFT — 2026-11-11**
+
+Copyright (c) 2026 Etcito SAS. All rights reserved except as expressly granted below.
+
+This is a source-available license. It is not an open-source license and is not OSI-approved. It permits commercial use subject to the royalty, attribution, and other conditions below.
+
+> **Draft status:** This document has not been applied to a repository. Complete the bracketed company and contact fields before publication and have the final text reviewed by qualified legal counsel.
+
+## 1. LICENSOR AND SCOPE
+
+The licensor is **Etcito SAS**, a French simplified joint-stock company, and its lawful successors ("Etcito").
+
+- **Registered office:** [COMPLETE: street address], 94800 Villejuif, France.
+- **SIREN:** [COMPLETE: nine-digit company identification number].
+- **RCS registration:** [COMPLETE: registration city and number].
+- **Licensing, royalty reports, payment instructions, and custom agreements:** [COMPLETE: contact email address].
+
+This License applies to the Etcito software libraries and components identified as covered by it in the repository, its package notices, or individual file headers. It covers their source code, binaries, associated interface and build files, accompanying documentation, and modifications of that material (the "Software"), only to the extent Etcito has authority to license it.
+
+The Etcito editor and hosted creation tools are governed by separate terms. Merely using an editor or a library to produce an output does not make that output subject to this License.
+
+Example Content and third-party material described in Section 8 are excluded from the Software and retain their separate licenses. Including a library in a template does not turn that library into Example Content.
+
+## 2. DEFINITIONS
+
+**"You"** means the individual or legal entity exercising rights under this License. If You act for an entity, You must be authorized to accept these terms on its behalf. Its employees, contractors, and automated agents may exercise the licensed rights on its behalf and under its responsibility; no separate seat fee applies.
+
+**"Product"** means a game, application, tool, or service that You make available to others, or develop for that purpose, and that incorporates, loads, links to, or otherwise executes any part of the Software's code to provide its functionality. This includes execution on a server serving the Product, whether or not the Software is delivered to end users. A modification of the Software remains Software for this definition.
+
+**"Distribute"** means to provide copies to another person or entity or make a Product's functionality available to them over a network. Internal use by people acting on Your behalf under this License does not, by itself, create an externally distributed Product.
+
+**"Asset Outputs"** means models, meshes, images, textures, audio, animations, other creative resources, and generated files that do not incorporate covered Software code or require that code at runtime. Their creation, conversion, compilation, or export using the Software does not, by itself, make them Products. A work using only these outputs is likewise not a Product under this License, regardless of the number, proportion, or importance of those outputs. Separate rights in included Example Content or third-party material still apply.
+
+**"Example Content"** means Etcito-provided example objects, sounds, other creative assets, game templates, and the original example gameplay code supplied with those templates, identified as examples in the repository, its notices, or file headers. It excludes the Etcito libraries and runtime components that those examples import, link to, bundle, or execute.
+
+**"Gross Revenue"** means worldwide revenue directly attributable to a covered Product, calculated under Section 5 before deduction of platform commissions, publisher shares, payment-processing charges, development costs, or other business expenses.
+
+## 3. LICENSE GRANT AND PRODUCT DISTRIBUTION
+
+Subject to this License, Etcito grants You a non-exclusive, worldwide license to use, copy, study, modify, and build the Software, and to Distribute Products containing it. This grant continues for the duration of the applicable intellectual property rights unless terminated under Section 11.
+
+You may distribute the Software as an integrated part of a Product in source, compiled, or bundled form, including JavaScript and WebAssembly. Separate distribution of the Software itself is governed by Section 7.
+
+You may license Your own code and content under terms of Your choice, provided those terms preserve the rights and obligations applicable to the Software, Example Content, and third-party material. This License does not require publication of Your Product's source code or of Your private modifications.
+
+Etcito directly permits recipients of a compliant Product to execute and make the copies of the incorporated Software reasonably necessary to install, use, back up, and reinstall that Product. No separate Etcito royalty or report is required from an end user merely for using the Product. This limited permission does not authorize extraction of the Software for use in another product without a suitable license.
+
+You may engage publishers and distributors to distribute the Product on Your behalf. You remain responsible for compliance and royalty reporting unless Etcito agrees in writing that an identified party will assume those obligations. A revenue amount must never be charged twice merely because more than one party participates in distribution.
+
+## 4. ROYALTY-FREE USE
+
+Personal use, study, teaching, research, experimentation, and internal use are royalty-free when they generate no Gross Revenue under Section 5. A Product with no Gross Revenue owes no royalty, including a Product released free of charge.
+
+A Product's first USD 100,000 of cumulative Gross Revenue is also royalty-free. No periodic revenue report is required before a royalty becomes due.
+
+Royalty-free use remains subject to this License, including the attribution requirements in Section 6 and the restrictions in Section 7. A free Product funded by advertising or other attributable revenue is not a zero-revenue Product.
+
+## 5. COMMERCIAL USE AND ROYALTIES
+
+### 5.1. Rate, allowance, and no stacking
+
+For each Product, the first **USD 100,000** of cumulative Gross Revenue is exempt. You owe **1% of Gross Revenue above that amount**. The allowance applies once over the Product's lifetime, not once per year.
+
+The 1% royalty and USD 100,000 allowance apply once in total to a Product, regardless of how many Etcito libraries, components, packages, or repositories covered by this License it uses. Royalties paid under this License for the same Product and revenue count toward this single obligation.
+
+For example, USD 150,000 of cumulative Gross Revenue produces USD 500 of cumulative royalties; USD 1,000,000 produces USD 9,000.
+
+### 5.2. Revenue included
+
+Gross Revenue includes revenue directly attributable to Product sales, subscriptions, access, in-app purchases, downloadable content, advertising, sponsorship, licensing, and Product-specific service fees. It also includes preorders, crowdfunding amounts exchanged for Product access or benefits, and publisher advances attributable to a covered Product. Non-cash consideration is included at its reasonable, documented monetary value.
+
+Count revenue whether received by You, a publisher, a distributor, an affiliate, or another party collecting revenue from the Product. For a sale through a store, the starting amount is the amount paid by the customer before the store's commission, subject to the exclusions below.
+
+Count the same revenue only once as it passes between these parties. Publisher advances attributable to a covered Product are counted when received, subject to Section 5.4. From subsequent Product receipts, exclude amounts applied to recoup advances already included in Gross Revenue, up to the amount of those previously counted advances. An advance excluded from Gross Revenue cannot create this credit.
+
+### 5.3. Revenue excluded and allocations
+
+Gross Revenue excludes:
+
+1. VAT, sales taxes, and similar transaction taxes collected for payment to a public authority;
+2. amounts actually refunded to customers and chargebacks, with no duplicate deduction;
+3. genuine donations, grants, or prizes that are not consideration for Product access, benefits, delivery, or services;
+4. equity investment and loan principal that are financing rather than payment for the Product; and
+5. revenue from separate goods or services that do not themselves qualify as a Product, including sales merely promoted through a free Product.
+
+For a bundle, subscription, or contract covering multiple products or services, allocate revenue reasonably and consistently to the covered Product using a documented method reflecting their respective value. Transfers between related entities must not artificially reduce the revenue attributable to a Product.
+
+### 5.4. Adoption, removal, and continuity
+
+Revenue attributable exclusively to sales or operations before the Product first used the Software is excluded and does not consume the USD 100,000 allowance. Preorders and publisher advances received before that first use are also excluded, even if they relate to a later covered version; they cannot be credited against later Gross Revenue as previously counted advances. Revenue attributable exclusively to versions or service operations that no longer contain, execute, or depend on any covered Software code is also excluded.
+
+Removing the Software does not cancel obligations already accrued. Revenue attributable to covered versions, sales, or operations remains included even if received after removal. Removing and later reintroducing the Software does not reset accumulated Gross Revenue or the allowance.
+
+Ports, platform releases, editions, updates, renamings, and substantially equivalent re-releases of the same Product share one allowance. A change of publisher, distributor, owner, or legal entity does not create a new allowance. Genuinely separate games or applications have separate allowances. These grouping rules do not bring versions that are excluded under the preceding paragraphs into the royalty base.
+
+### 5.5. Quarterly calculation and payment
+
+Within **30 days after the end of each calendar quarter** in which a royalty becomes payable, send Etcito a statement identifying the Product, the quarter's Gross Revenue, relevant exclusions and adjustments, cumulative Gross Revenue, and the royalty due, and pay that royalty.
+
+Calculate the cumulative royalty as 1% of the positive amount by which cumulative Gross Revenue exceeds USD 100,000. Subtract royalties already paid for that Product and pay the remaining positive balance. Later refunds, chargebacks, or corrections reduce the cumulative calculation; any resulting overpayment is credited against future royalties for that Product.
+
+Amounts are calculated in US dollars. Convert other currencies using a consistently applied published exchange rate for the receipt date or a published average for the receipt month, and identify the source in the statement. Payments are in US dollars unless Etcito agrees otherwise in writing. Etcito supplies payment instructions through the contact in Section 1. Taxes legally chargeable on Etcito's royalty invoice, if any, are additional to the royalty amount.
+
+### 5.6. Records and verification
+
+Keep records reasonably sufficient to support Your reports for three years after the relevant report, or longer if mandatory law requires. On a reasonable written request, provide relevant summaries or supporting records sufficient to verify the calculation. Etcito must keep non-public financial information confidential and use it only to administer or enforce this License, subject to legally required disclosure. Unrelated customer data or unrelated business records are not required.
+
+### 5.7. Etcito's own products
+
+Etcito's own Products are exempt from the royalty obligation in this section. This exemption does not change any third-party license or obligation.
+
+## 6. REQUIRED ATTRIBUTION
+
+### 6.1. Games: mandatory startup splash credit
+
+Every game Product that uses any covered Software component, including a modified component or one used only on the game's server, must display the exact text:
+
+**Powered by Etcito**
+
+The text must appear on a startup splash screen during each normal launch, before the player reaches the main menu or gameplay. It may share a screen with other startup credits, but must be clearly visible, legible, and displayed long enough to be read under normal viewing conditions. It must not be hidden behind an optional credits menu, an external link, or a user setting. If the game has no startup splash screen, You must add one containing this credit.
+
+This requirement applies to free and paid games, demos, and non-commercial releases, including those below the royalty allowance. It applies regardless of how small the covered Software component is. A credits page alone does not satisfy it.
+
+### 6.2. Other Products and source distributions
+
+For a Product that is not a game, display **Powered by Etcito** in its startup screen if it has one; otherwise place it in a readily accessible About, Credits, or Legal Notices view. For a Product without a graphical interface, include the credit in its user-facing documentation or service documentation. Source distributions and packages must preserve the notices required by Section 7.
+
+### 6.3. Notices, marks, and custom exceptions
+
+Keep applicable copyright, license, and provenance notices with the Software or in accompanying legal notices when a build transformation changes their original placement. The splash credit does not replace these notices.
+
+Etcito permits use of its name solely as needed to provide the attribution required by this section. No logo is required. This permission does not authorize an implication of endorsement, sponsorship, partnership, or official status, or any other use of Etcito's marks.
+
+The royalty and splash requirements do not apply merely because a Product uses Asset Outputs or Example Content without covered Software code. Example Content's own attribution requirements remain applicable.
+
+Only a separate written custom license or written waiver from Etcito may remove or alter the attribution requirements for a covered Product. Contact Etcito using the details in Section 1.
+
+## 7. SOURCE REDISTRIBUTION, FORKS, AND RESTRICTIONS
+
+You may publish forks and redistribute the Software, including modifications, in source archives or packages under this same License. Give recipients a copy of this License, preserve existing notices, identify modifications, and make clear that an unofficial fork is not an official Etcito release. Recipients receive their rights to the Software directly under this License; they need not obtain a separate paid license merely to receive a fork.
+
+When You distribute modifications that You own, You grant each recipient the rights described in Section 3 in those modifications, subject to this License. You must have authority to grant those rights.
+
+Your distribution terms must not replace, remove, or contradict this License for the Software. You may add accurate notices identifying Your own contributions. Public repositories, free package distribution, and ordinary hosting of source archives are permitted.
+
+Without a separate written agreement with Etcito, You may not:
+
+1. relicense the Software under different terms or sell the Software itself or a modified version as a standalone commercial library or SDK;
+2. offer the Software itself as a hosted developer service, reusable API, or development infrastructure whose principal purpose is to let third parties use the Software as a substitute for obtaining it from Etcito or an authorized distribution;
+3. remove or misrepresent copyright, license, or provenance notices; or
+4. use Etcito's name or marks beyond the attribution permission in Section 6, or suggest Etcito endorses Your Product or fork.
+
+The hosted-service restriction does not prohibit an ordinary game backend or an application or service providing its own end-user functionality using the Software. Nor does it prohibit internal hosting for Your own development. The source redistribution permission does not, by itself, authorize a prohibited hosted offering, even if that offering is free.
+
+## 8. EXAMPLES, TEMPLATES, AND THIRD-PARTY MATERIAL
+
+Etcito licenses its **Example Content, including original example gameplay code in game templates, under Creative Commons Attribution 4.0 International (CC BY 4.0)**:
+
+- License and summary: <https://creativecommons.org/licenses/by/4.0/>
+- Full legal text: <https://creativecommons.org/licenses/by/4.0/legalcode.en>
+
+CC BY 4.0 governs that material. Its attribution, license-notice, and modification-notice obligations remain applicable. The royalties, mandatory splash screen, and restrictions of this ETCITO LICENSE do not apply to Example Content itself and do not add conditions to its Creative Commons license.
+
+Etcito software libraries and runtime components remain under this License when imported, linked, bundled, or otherwise used by a template. Using a template that executes such a component therefore requires compliance with this License for that component, including the splash credit and any royalty due for the resulting Product.
+
+Third-party code, assets, dependencies, and other material remain governed by their respective licenses. Their identities and terms must be preserved in the relevant file headers, license files, or `PROVENANCE.md`. Nothing in this document replaces those licenses or grants rights Etcito does not hold. Separately licensed components must remain identifiable when distributed together.
+
+## 9. OWNERSHIP, MODIFICATIONS, AND CONTRIBUTIONS
+
+You retain ownership of Your Products, Your original code, and Your original modifications, subject to the rights in the underlying Software and any other material You use. Etcito retains its rights in the Software. Distribution and use of modifications to covered Software remain subject to this License; privately making a modification does not require You to publish or submit it.
+
+If You intentionally submit original code, documentation, or other material to Etcito for inclusion in the Software (a "Contribution"), You grant Etcito a non-exclusive, worldwide, irrevocable, royalty-free license for the duration of the applicable rights to reproduce, use, modify, distribute, sublicense, and relicense that Contribution as part of the Software, including under commercial terms.
+
+You must have authority to grant those rights and identify any third-party material and its license. A bug report, attached project, or reproduction file is not a Contribution merely because it is supplied for diagnosis, unless You expressly submit the relevant material for inclusion. Separately licensed material retains its applicable terms; this contribution clause does not override rights You cannot grant.
+
+## 10. NO WARRANTY AND LIMITATION OF LIABILITY
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTIES OF ANY KIND, WHETHER EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, ETCITO IS NOT LIABLE FOR CLAIMS, DAMAGES, OR LOSSES ARISING FROM THE SOFTWARE OR ITS USE, INCLUDING LOSS OF DATA, REVENUE, OR PROFITS. NOTHING IN THIS LICENSE EXCLUDES OR LIMITS LIABILITY THAT APPLICABLE LAW DOES NOT ALLOW TO BE EXCLUDED OR LIMITED, OR REMOVES NON-WAIVABLE STATUTORY RIGHTS.
+
+## 11. BREACH AND TERMINATION
+
+If You breach this License, Etcito may give written notice identifying the breach. If You do not cure it within 30 days after receiving the notice, Your license terminates. A compliant license is not otherwise revocable by Etcito at will.
+
+After termination, You must stop further use and distribution of the Software that requires this License. Termination does not cancel accrued royalties, reporting and record obligations relating to covered activity, confidentiality obligations, or liability for an existing breach.
+
+End users who lawfully received Products before termination retain the limited rights in Section 3 to continue using, backing up, and reinstalling those copies, provided they respect the scope of those rights. Termination does not itself authorize You to make new distributions or grant new licenses. Required notices remain with retained copies.
+
+## 12. GENERAL TERMS AND CUSTOM AGREEMENTS
+
+**Transfer of a Product.** You may transfer the licensed rights associated with a Product when transferring that Product or the business responsible for it, provided the recipient accepts this License in writing, assumes its prospective obligations, and receives the information needed to preserve the Product's cumulative royalty calculation. Notify Etcito in writing. Accrued obligations remain Your responsibility unless Etcito agrees otherwise. The transfer does not reset the allowance.
+
+**Custom agreements.** Etcito may offer separate written commercial licenses, including different royalty terms or an exemption from the splash requirement. An agreement signed or expressly confirmed in writing by Etcito takes precedence only for the Products, parties, and terms it expressly covers. A request, negotiation, or payment without such agreement is not a waiver.
+
+**Applicable law.** This License is governed by French law, subject to mandatory protections that apply to You and cannot be excluded by agreement. Disputes fall within the jurisdiction of the courts competent under applicable procedural law; this clause does not displace mandatory jurisdiction rules.
+
+**Notices.** Send licensing notices and reports to Etcito's contact in Section 1. Etcito may send notices to an email or postal address You have designated for the Product or licensing relationship. A breach notice must identify the breach; its cure period starts upon receipt.
+
+**Entire agreement and severability.** This License, together with any applicable written custom agreement, states the agreement concerning the covered Software. Separate editor, Example Content, and third-party terms remain separate. If a provision is unenforceable, the remainder continues to apply to the extent permitted by law. A waiver of one breach does not waive a later breach.
+
+**Acceptance.** By exercising rights granted under this License, You accept its conditions. Nothing here restricts acts that applicable law permits without a license, or affects rights that cannot lawfully be waived.
