@@ -2,9 +2,9 @@ import type RAPIER from "@dimforge/rapier3d-deterministic-compat";
 import { fnv1a32 } from "./hash.ts";
 import type { RapierModule } from "./init.ts";
 
-/** Simulation rate. The sim never reads a wall clock: one step() = one tick. */
+/** Default simulation rate. The sim never reads a wall clock: one step() = one tick. */
 export const TICK_RATE = 60;
-/** Fixed timestep handed to Rapier. 1/60 as a double; identical on every platform. */
+/** Default fixed timestep handed to Rapier. 1/60 as a double; identical on every platform. */
 export const FIXED_DT = 1 / TICK_RATE;
 
 /** Stable body id. Allocated by the sim, never reused, survives snapshot/restore. */
@@ -12,7 +12,12 @@ export type BodyId = number;
 
 export interface RapierWorldSimOptions {
   gravity?: { x: number; y: number; z: number };
-  /** Defaults to FIXED_DT. Change only if all peers do the same. */
+  /**
+   * Ticks per second. Defaults to TICK_RATE (60). Used to derive dt when dt is not given.
+   * Must be the same on every peer, like the rest of the configuration.
+   */
+  tickRate?: number;
+  /** Fixed timestep in seconds. Defaults to 1 / tickRate (FIXED_DT for the default rate). */
   dt?: number;
 }
 
@@ -41,6 +46,7 @@ const ENTRY_BYTES = 12; // id u32 + handle f64
  */
 export class RapierWorldSim {
   readonly R: RapierModule;
+  readonly tickRate: number;
   readonly dt: number;
   #world: RAPIER.World;
   /** id -> handle, in insertion order (Map preserves it). */
@@ -51,7 +57,11 @@ export class RapierWorldSim {
 
   constructor(R: RapierModule, opts: RapierWorldSimOptions = {}) {
     this.R = R;
-    this.dt = opts.dt ?? FIXED_DT;
+    if (opts.tickRate !== undefined && !(Number.isFinite(opts.tickRate) && opts.tickRate > 0)) {
+      throw new Error(`invalid tickRate ${opts.tickRate}`);
+    }
+    this.tickRate = opts.tickRate ?? TICK_RATE;
+    this.dt = opts.dt ?? (opts.tickRate === undefined ? FIXED_DT : 1 / this.tickRate);
     const g = opts.gravity ?? { x: 0, y: -9.81, z: 0 };
     this.#world = new R.World(g);
     this.#world.timestep = this.dt;

@@ -1,13 +1,33 @@
 import { test } from "node:test";
 import assert from "node:assert";
 import { getR } from "./scenario.ts";
-import { RapierWorldSim } from "../src/index.ts";
+import { RapierWorldSim, FIXED_DT } from "../src/index.ts";
 
 const R = await getR();
 
 function ground(s: RapierWorldSim) {
   return s.createBody(R.RigidBodyDesc.fixed(), [R.ColliderDesc.cuboid(50, 0.5, 50).setTranslation(0, -0.5, 0)]);
 }
+
+test("non-default tick rate: dt follows tickRate, and it survives restore", () => {
+  const s = new RapierWorldSim(R, { tickRate: 30 });
+  assert.equal(s.tickRate, 30);
+  assert.equal(s.dt, 1 / 30);
+  const b = s.createBody(R.RigidBodyDesc.dynamic().setTranslation(0, 100, 0), [R.ColliderDesc.ball(0.5)]);
+  const snap = s.takeSnapshot();
+  for (let t = 0; t < 30; t++) s.step();
+  // free fall for exactly one second of simulated time at 30 ticks/s
+  assert.ok(Math.abs(s.body(b).linvel().y - -9.81) < 1e-3, `vy=${s.body(b).linvel().y}`);
+  s.restoreSnapshot(snap);
+  // Rapier stores the timestep as f32, so compare with a tolerance
+  assert.ok(Math.abs(s.world.timestep - 1 / 30) < 1e-7);
+  assert.equal(s.dt, 1 / 30);
+  assert.equal(s.tick, 0);
+  const d = new RapierWorldSim(R);
+  assert.equal(d.tickRate, 60);
+  assert.equal(d.dt, FIXED_DT);
+  assert.throws(() => new RapierWorldSim(R, { tickRate: 0 }), /invalid tickRate/);
+});
 
 test("kinematic bodies (position-based) survive restore, next-kinematic target included", () => {
   const s = new RapierWorldSim(R);
