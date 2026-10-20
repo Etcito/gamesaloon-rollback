@@ -22,7 +22,7 @@ const codec: InputCodec<Pad> = {
   neutral: 0,
 }
 
-class MySim implements Simulation<Pad> {              // integer / fixed-point math only, see docs/DESIGN.md
+class MySim implements Simulation<Pad> {              // integer / fixed-point math only, see the design notes below
   tick = 0
   x = new Int32Array(2); y = new Int32Array(2)
   step(inputs: readonly Pad[]) {
@@ -56,7 +56,9 @@ const t0 = net.transport(0), t1 = net.transport(1)    // one NetTransport per pe
 net.advance(1000 / 60)                                // virtual clock, call before each frame
 ```
 
-See `test/` for a full reference simulation and scenarios with 2, 3 and 4 peers, forced desync, late start and drops.
+The repository has a runnable example (`examples/minimal.ts`) and a full reference simulation with scenarios for
+2, 3 and 4 peers, forced desync, late start and drops (`test/`). Design notes, determinism rules and known limits:
+[docs/DESIGN.md](https://github.com/Etcito/gamesaloon-rollback/blob/main/docs/DESIGN.md).
 
 ## API
 
@@ -73,8 +75,10 @@ See `test/` for a full reference simulation and scenarios with 2, 3 and 4 peers,
 Tuning (all optional): `tickRate` (60), `maxSubsteps` (8), `maxPrediction` (16), `snapshotRing` (40), `minDelay` /
 `maxDelay` (2 / 8), `delayHiddenTicks` (6), `lostAfterMs` (3000), `dropWaitMs` (1500), `dumpTicks` (240).
 
-## Scripts
+## Build and scripts
 
-`npm test` (Node 22.18+, `node --experimental-strip-types --test`), `npm run typecheck`.
+The package ships `dist/` (ESM JavaScript and `.d.ts`), built from `src/` by `npm run build`; `main`, `types` and
+`exports` point at it. In the repository: `npm run build`, `npm test` (Node 22.18+, `node --experimental-strip-types
+--test`) and `npm run typecheck`.
 
-MIT.
+MIT, see [LICENSE](LICENSE).

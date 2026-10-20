@@ -9,7 +9,7 @@ This repository is a monorepo of two packages:
 | package | path | what it is |
 | --- | --- | --- |
 | `@gamesaloon/rollback` 0.1.0 | `packages/core` | The rollback core. Pure TypeScript, zero runtime dependencies, no DOM. |
-| `@gamesaloon/rollback-rapier` 0.0.1 | `packages/rapier` | Snapshot, restore and hash for a Rapier world (deterministic build, pinned to 0.21.0). |
+| `@gamesaloon/rollback-rapier` 0.1.0 | `packages/rapier` | Snapshot, restore and hash for a Rapier world (deterministic build, pinned to 0.21.0). |
 
 ## What it does
 
@@ -36,21 +36,35 @@ deterministic, needs more than 8 peers, or needs a late-join protocol (see limit
 
 ## Install
 
-The packages are **not published to npm** (`npm view @gamesaloon/rollback` returns 404) and there is no build step:
-`main`/`exports` point at the TypeScript sources (`src/index.ts`). What works today is cloning the repository:
+The packages are **not published to npm** (`npm view @gamesaloon/rollback` returns 404). Each package builds `dist/`
+(JavaScript ESM and `.d.ts`), and `main`, `types` and `exports` point there. Node 22.18 or newer.
+
+From a clone of the repository (tested with Node 24.22.0):
 
 ```sh
-git clone <url of this repository> gamesaloon-rollback
+git clone https://github.com/Etcito/gamesaloon-rollback
 cd gamesaloon-rollback
-npm install        # Node >= 22.18
-npm test           # core and rapier tests
+npm install          # dependencies, and dist/ of both packages (their prepare script runs the build)
+npm run build        # rebuild dist/ of both packages
+npm test             # core (26 tests) and rapier (11 tests)
 ```
 
-Then either work inside the workspace (add your game as another `packages/*` entry and depend on
-`@gamesaloon/rollback`), or vendor `packages/core/src` into your project: it has no dependencies. Because the entry
-points are `.ts` files, consume them through a TypeScript-aware bundler (Vite, esbuild, ...) or, in Node, from a path
-that is not under `node_modules` (Node does not strip types of files inside `node_modules`). The scripts use
-`node --experimental-strip-types`. The tests were run here with Node 24.21.0.
+To use the packages in another project, pack them and install the tarballs (tested end to end: the compiled
+`packages/core/examples/minimal.ts` against the installed tarball prints the same confirmed hashes as this README):
+
+```sh
+cd gamesaloon-rollback/packages/core  && npm pack --pack-destination /path/to/tarballs
+cd ../rapier                          && npm pack --pack-destination /path/to/tarballs
+cd /path/to/your-game                 && npm install /path/to/tarballs/gamesaloon-rollback-0.1.0.tgz /path/to/tarballs/gamesaloon-rollback-rapier-0.1.0.tgz
+```
+
+`@gamesaloon/rollback-rapier` has `@dimforge/rapier3d-deterministic-compat` 0.21.0 as a peer dependency; npm installs
+it with the package (it must be the same version on every peer). The core has no runtime dependencies.
+
+Installing straight from git (`npm install git+https://github.com/Etcito/gamesaloon-rollback`) does not give you these
+packages: they live in subdirectories of this monorepo, and npm cannot install a subdirectory of a git repository. Use
+the tarballs above. A package that sits at the root of its own repository is built on git install (checked with a
+scratch repository).
 
 ## Minimal example (no network, no game)
 
@@ -147,7 +161,8 @@ transport.
 
 `RapierWorldSim` wraps a Rapier world so it can be snapshotted every tick, restored, and hashed:
 `initRapier()` (once, WASM embedded), `createBody`, `removeBody`, `body(id)`, `ids()`, `step()`, `takeSnapshot()`,
-`restoreSnapshot(bytes)`, `hash()`, `free()`, plus `TICK_RATE = 60` and `FIXED_DT = 1/60`. Bodies are addressed by
+`restoreSnapshot(bytes)`, `hash()`, `free()`, plus `TICK_RATE = 60` and `FIXED_DT = 1/60` (the defaults; pass
+`{ tickRate }` to `new RapierWorldSim(R, ...)` for another rate, which must match on every peer). Bodies are addressed by
 stable ids, not Rapier handles, and the id registry is part of the snapshot, so adding and removing bodies is rolled
 back correctly. Wrapping it as a `Simulation` takes a few lines, see [`docs/RAPIER.md`](docs/RAPIER.md), which also has
 measured costs (for example 200 bodies: about 1.1 ms per tick including a snapshot, about 10 ms for an 8-tick
@@ -173,11 +188,11 @@ peer. The short version (details in [`docs/DESIGN.md`](docs/DESIGN.md) section 2
 
 ## Status and limits
 
-Version 0.1.0 of the core, 0.0.1 of the adapter: early, not published, not battle-tested outside the tests below.
+Version 0.1.0 of both packages: early, not published, not battle-tested outside the tests below.
 
 - Tests: `npm test` runs core (26 tests: 2, 3 and 4 peers with latency, jitter, loss and reordering; several players
   per peer; observer; forced desync with dump and resync; late start; peer loss; wire, timing and codec units),
-  rapier (10 tests). All pass here.
+  rapier (11 tests). All pass here.
 - One u32 input per player per tick. At most 8 peers and 8 players per peer; full mesh, so traffic grows with the
   square of the peer count.
 - The peer roster is fixed at session creation: no late join into a running match, and a lost peer does not come back.
@@ -191,6 +206,6 @@ Version 0.1.0 of the core, 0.0.1 of the adapter: early, not published, not battl
 
 ## License
 
-MIT, copyright 2026 Etcito. See [`LICENSE`](LICENSE). The Rapier adapter depends on
-`@dimforge/rapier3d-deterministic-compat` (Apache-2.0, Dimforge) and credits ideas from Sketchbook (MIT); see
+MIT, copyright 2026 Etcito. See [`LICENSE`](LICENSE). The Rapier adapter uses
+`@dimforge/rapier3d-deterministic-compat` (Apache-2.0, Dimforge) as a peer dependency and credits ideas from Sketchbook (MIT); see
 `packages/rapier/NOTICE`.
