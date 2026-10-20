@@ -1,0 +1,65 @@
+name: release
+
+# A release is a version tag v<version> pushed to this repository. The workflow builds and tests
+# both packages, packs them with scripts/release-pack.mjs (the same script as npm run release:pack)
+# and attaches the tarballs and SHA256SUMS to the GitHub Release for that tag.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a tag ref
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::error::Run the release from a tag v<version> (got ref $REF_NAME)"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Pack tarballs and SHA256SUMS (fails unless the tag is v<package version>)
+        run: node scripts/release-pack.mjs --tag "$GITHUB_REF_NAME"
+
+      - name: Verify checksums
+        run: cd release && sha256sum -c SHA256SUMS
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+          else
+            gh release create "$TAG" release/* --verify-tag --title "$TAG" --generate-notes
+          fi
