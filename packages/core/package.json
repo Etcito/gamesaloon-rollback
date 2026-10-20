@@ -5,19 +5,36 @@
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
-  "main": "./src/index.ts",
-  "types": "./src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./netsim": "./src/netsim.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./netsim": {
+      "types": "./dist/netsim.d.ts",
+      "default": "./dist/netsim.js"
+    }
   },
-  "files": ["src", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/rewrite-dts.mjs dist",
+    "prepare": "npm run build",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Etcito/gamesaloon-rollback",
+    "directory": "packages/core"
   }
 }

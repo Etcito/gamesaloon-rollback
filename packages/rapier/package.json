@@ -1,19 +1,25 @@
 {
   "name": "@gamesaloon/rollback-rapier",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Rapier (deterministic build) adapter for rollback netcode: snapshot, restore, hash, bit-exact resimulation.",
   "license": "MIT",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
   "files": [
-    "src",
+    "dist",
+    "LICENSE",
     "NOTICE"
   ],
   "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/rewrite-dts.mjs dist",
+    "prepare": "npm run build",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "bench": "node --experimental-strip-types test/bench.ts",
     "typecheck": "tsc --noEmit -p ."
@@ -25,5 +31,10 @@
   },
   "peerDependencies": {
     "@dimforge/rapier3d-deterministic-compat": "0.21.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Etcito/gamesaloon-rollback",
+    "directory": "packages/rapier"
   }
 }
