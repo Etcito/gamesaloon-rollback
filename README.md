@@ -66,6 +66,27 @@ packages: they live in subdirectories of this monorepo, and npm cannot install a
 the tarballs above. A package that sits at the root of its own repository is built on git install (checked with a
 scratch repository).
 
+## Releases
+
+Each release is a tag `v<version>`. The GitHub Release for that tag carries the built tarballs and `SHA256SUMS`
+(built and attached by `.github/workflows/release.yml`; the tarballs contain `dist/`, so nothing is built on install):
+
+```
+https://github.com/Etcito/gamesaloon-rollback/releases/download/v<version>/gamesaloon-rollback-<version>.tgz
+https://github.com/Etcito/gamesaloon-rollback/releases/download/v<version>/gamesaloon-rollback-rapier-<version>.tgz
+https://github.com/Etcito/gamesaloon-rollback/releases/download/v<version>/SHA256SUMS
+```
+
+Install a release in your game (npm installs the rapier peer dependency with it):
+
+```sh
+npm install https://github.com/Etcito/gamesaloon-rollback/releases/download/v0.1.0/gamesaloon-rollback-0.1.0.tgz             https://github.com/Etcito/gamesaloon-rollback/releases/download/v0.1.0/gamesaloon-rollback-rapier-0.1.0.tgz
+```
+
+To cut a release: set the same `version` in `packages/core/package.json` and `packages/rapier/package.json`, commit,
+then `git tag v<version>` and `git push origin v<version>`. The workflow fails if the tag is not `v` plus the package
+version. To check the tarballs locally first, run `npm run release:pack`; they land in `release/` (gitignored).
+
 ## Minimal example (no network, no game)
 
 Two peers, two players, a simulated lossy network. The file is `packages/core/examples/minimal.ts`:
