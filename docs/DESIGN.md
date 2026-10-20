@@ -1,9 +1,7 @@
 # Design of @gamesaloon/rollback
 
-This library is a generic extraction of the rollback netcode of Monster Racer, a kart racing game by the same owner.
-It is a clean descendant of that code only. This document describes the architecture, the determinism rules a
-game must follow, what changed when the kart coupling was removed, and one open design question (interest
-management).
+This document describes the architecture of the library, the determinism rules a game must follow, the known limits,
+and one open design question (interest management). The origin of the code is in [`PROVENANCE.md`](PROVENANCE.md).
 
 ## 1. What it does
 
@@ -90,8 +88,8 @@ machine and browser.
    is part of the snapshot (`Rng` is provided).
 3. **No platform-dependent math.** `+ - * /`, `Math.sqrt`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `trunc`,
    `fround` and `Math.imul` are exactly specified. Transcendental functions (`sin`, `cos`, `atan2`, `exp`, `pow`, `log`...)
-   differ between engines: use your own (polynomial) implementations, or integer / fixed-point math. Monster Racer
-   forbids them in simulation code and checks it with a source scan; do the same.
+   differ between engines: use your own (polynomial) implementations, or integer / fixed-point math. Keep them
+   out of simulation code and check it with a source scan.
 4. **Deterministic iteration order.** Iterate arrays by index; sort with total orders (index tiebreak); no reliance on
    `Set`/`Map` insertion order unless it is itself deterministic.
 5. **Inputs are quantised.** The simulation only sees `decode(encode(x))`. The session guarantees it, also for the
@@ -101,36 +99,13 @@ machine and browser.
 7. **Floating point is allowed only if you can prove it bit-exact** (IEEE-754 doubles with the operations of rule 3 and
    no fused multiply-add differences, which JS does not do). Physics engines (see `packages/rapier`) need their own
    determinism guarantees.
-8. **Hot path discipline.** `step`, `read`, `encode` and `decode` should not allocate. The session itself keeps the Monster Racer discipline: reused buffers, rings and message objects, no per-tick allocation in the tick/receive/send path. It still allocates a small `SnapReader` per rollback and, on a desync, the dump and snapshot parts; those are rare events. This is by construction, not enforced by a test.
+8. **Hot path discipline.** `step`, `read`, `encode` and `decode` should not allocate. The session itself follows the same discipline: reused buffers, rings and message objects, no per-tick allocation in the tick/receive/send path. It still allocates a small `SnapReader` per rollback and, on a desync, the dump and snapshot parts; those are rare events. This is by construction, not enforced by a test.
 
 Hashes: by default the session hashes the snapshot bytes (fnv1a32), so a game gets desync detection for free and the
 hash covers exactly what is restorable. `Simulation.hash()` is an optional fast path; if present it is called once per
 simulated tick before `step` and must cover the same state.
 
-## 3. What was generalised compared to the kart original
-
-| Monster Racer | here |
-| --- | --- |
-| `RaceSession` (karts, track, controllers, events, `saveState`/`loadState`) | `Simulation<TInput>`: `tick`, `step(inputs)`, `snapshot(w)`, `restore(r)`, optional `hash`, `playerDropped`, `beginResim`/`endResim`, `view` |
-| `KartInput` + `packInput`/`unpackInput`/`NEUTRAL_CODE` (hard-coded layout) | `InputCodec<TInput>` (`create`, `encode`, `decode`, `neutral`) |
-| karts per peer, max 8 (`MAX_WIRE_KARTS`), human karts only | players per peer, any number from 0 to 8 per peer (`MAX_WIRE_PLAYERS`); players nobody owns get the neutral input; observer peers with 0 players |
-| 'net' controller reading `race.ext('net.inputs')` | the session passes the decoded inputs array straight to `step` |
-| lost peer's karts switch to AI controllers (`setController`) | lost peer's players get `neutral` input from `S + 1` and `playerDropped(player)` is called |
-| `events.muted` during re-simulation | `beginResim` / `endResim` hooks |
-| `setup: RaceSetup` in the desync dump | `dumpInfo()` callback, opaque to the library |
-| kart `Vector3` / `Quaternion` smoothing with `dexp` | `CorrectionSmoother` over a flat float view (`SimView`), view-side only |
-| `SnapWriter.vec3/quat` (three.js) | removed; `i16`, `f32` added; zero dependencies |
-| constants (120 Hz tick, prediction 16, ring 40, delay 2..8, hidden 6, timeouts) | `RollbackTuning` options with defaults; tick rate default 60 Hz |
-| READY carried `raceIndex` / `setupHash` | same bytes renamed `session` / `configHash` |
-| hash = fnv1a32 of the snapshot | same by default, `Simulation.hash()` optional |
-| `RollbackSession` constructor took a CPU timer | `cfg.cpuMs` optional |
-
-Kept unchanged: fixed tick and accumulator with `maxSubsteps`, snapshot ring, used-code ring, misprediction detection
-(`usedCode` vs late-arriving real code), earliest-tick rollback, stall at `maxPrediction`, RTT-driven delay, time sync,
-drop agreement with switch tick, desync episodes with majority authority, snapshot resync in reliable parts, checksum
-redundancy, `NetSim` and the whole wire format.
-
-### Not generalised (known limits)
+## 3. Known limits
 
 - **Inputs are one u32 per player per tick.** Games with larger inputs must pack or quantise. Variable-size inputs would
   need a length-prefixed wire format and variable-width input buffers.
@@ -144,11 +119,11 @@ redundancy, `NetSim` and the whole wire format.
 - **Resync snapshots older than `RESYNC_MAX_TICKS` (240) are refused**; the snapshot is a single reliable message of up
   to 16 MiB. Large worlds will want delta or interest-filtered snapshots (see below).
 - **`CorrectionSmoother` blends plain linear floats.** Rotations (quaternions) and wrapping angles are not handled.
-- **Time sync is the original heuristic** (skip a tick when ahead), not a clock-synchronisation protocol.
+- **Time sync is a simple heuristic** (skip a tick when ahead), not a clock-synchronisation protocol.
 
 ## 4. Interest management (open design question)
 
-The owner wants rollback by proximity zones: a peer fully simulates, predicts and rolls back only the entities near it,
+The planned direction is rollback by proximity zones: a peer fully simulates, predicts and rolls back only the entities near it,
 and drives the far ones from received state. This is **not implemented**. The current model is the opposite: a global
 deterministic lockstep-with-rollback where every peer simulates everything, and any peer's input can invalidate any
 tick.
