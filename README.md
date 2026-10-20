@@ -4,13 +4,12 @@ Deterministic rollback netcode for browser and Node games, in TypeScript, plus a
 [Rapier](https://rapier.rs) physics engine rollback-safe. It is game-agnostic and transport-agnostic: you bring a
 deterministic simulation and a way to move bytes between peers, the library does the rest.
 
-This repository is a monorepo of three packages:
+This repository is a monorepo of two packages:
 
 | package | path | what it is |
 | --- | --- | --- |
 | `@gamesaloon/rollback` 0.1.0 | `packages/core` | The rollback core. Pure TypeScript, zero runtime dependencies, no DOM. |
 | `@gamesaloon/rollback-rapier` 0.0.1 | `packages/rapier` | Snapshot, restore and hash for a Rapier world (deterministic build, pinned to 0.21.0). |
-| `@gamesaloon/kart-spike` (private) | `packages/kart-spike` | A feasibility experiment (an arcade kart on Rapier compared with a hand-written sim). Not a library, see "Status and limits". |
 
 ## What it does
 
@@ -44,7 +43,7 @@ The packages are **not published to npm** (`npm view @gamesaloon/rollback` retur
 git clone <url of this repository> gamesaloon-rollback
 cd gamesaloon-rollback
 npm install        # Node >= 22.18
-npm test           # core, rapier and kart-spike tests
+npm test           # core and rapier tests
 ```
 
 Then either work inside the workspace (add your game as another `packages/*` entry and depend on
@@ -178,7 +177,7 @@ Version 0.1.0 of the core, 0.0.1 of the adapter: early, not published, not battl
 
 - Tests: `npm test` runs core (26 tests: 2, 3 and 4 peers with latency, jitter, loss and reordering; several players
   per peer; observer; forced desync with dump and resync; late start; peer loss; wire, timing and codec units),
-  rapier (10 tests) and kart-spike (10 tests). All pass here.
+  rapier (10 tests). All pass here.
 - One u32 input per player per tick. At most 8 peers and 8 players per peer; full mesh, so traffic grows with the
   square of the peer count.
 - The peer roster is fixed at session creation: no late join into a running match, and a lost peer does not come back.
@@ -189,8 +188,6 @@ Version 0.1.0 of the core, 0.0.1 of the adapter: early, not published, not battl
 - Interest management (rollback by proximity zones) is not implemented; `Simulation.regions` is a reserved seam the
   session ignores.
 - `CorrectionSmoother` blends plain linear floats; it does not handle quaternions or wrapping angles.
-- `packages/kart-spike` is a private experiment, copied in part from a kart game by the same owner, and is not part of
-  the library surface.
 
 ## License
 
