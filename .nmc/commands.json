@@ -1,0 +1,7 @@
+[
+  {
+    "name": "zone-scale-long",
+    "command": "node --experimental-strip-types --test packages/core/test/long/zone-scale.long.ts",
+    "timeout_s": 3600
+  }
+]
