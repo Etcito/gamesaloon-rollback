@@ -5,7 +5,7 @@ and one open design question (interest management). The origin of the code is in
 
 ## 1. What it does
 
-Rollback by zones (per-domain sessions for large matches) is described in [`ZONES.md`](ZONES.md).
+For per-domain rollback, assignment, wire messages and recovery, see [`ZONES.md`](ZONES.md).
 
 Every peer runs the whole simulation locally at a fixed tick rate. A peer never waits for the network to advance:
 
