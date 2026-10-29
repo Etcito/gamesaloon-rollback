@@ -110,15 +110,19 @@ rollback follows.
   including states kept during handoff grace, so an agreement spanning a boundary can complete.
 - **Rejoin:** a returning peer is an observer (its control words carry `CONTROL_NO_CELL`), receives DOMAIN_SNAPSHOT
   for its assigned domains, and its seats switch back at the next epoch boundary with `seatHost(seat, peer, false)`.
-  The `observer` config flag starts a late rejoin that way. Each producer sends the returning peer its newest
-  retained snapshot at or below confirmed for every current and grace state it produces, unless none is retained.
+  The `observer` config flag starts a late rejoin that way. The rejoin boundary R is the first unplanned boundary
+  on the established side when it hears the peer again. Each producer sends the returning peer its newest retained
+  snapshot at or below min(confirmed, R-1) for every current and grace state it produces, unless none is retained.
+  It waits until confirmed reaches R-K, so the snapshot belongs to epoch R/K-1 and the observer seats itself at R.
+  ZDROP and SHADOW from a peer that is still observing are ignored, so stale state from a split side cannot land.
   An observer awaiting a snapshot accepts the producer for the snapshot tick's epoch, recomputed with `assign`
   from that epoch's CONTROL samples and roster. Until those samples are available, it accepts a complete snapshot
   from the lowest-id live replica it has heard from. It adopts that epoch's assignment and switches to seated play
   at the next epoch boundary.
 - **Resend after silence:** after more than `max(4 tick durations, 100 ms)` without news from a peer, its next frame
   rewinds its resend cursors. CONTROL and the producer's SHADOW frames are resent directly to it, reliably and in
-  order, from its last reported confirmed tick plus one; CONTROL uses the global domain's confirmed tick.
+  order, from its last reported confirmed tick plus one; CONTROL uses the global domain's confirmed tick. The
+  `resendSilenceMs` session option overrides the silence threshold.
   When that tick is unknown, start at the oldest retained tick. Duplicates are harmless: identical words or shadow
   payloads are stored idempotently and schedule no rollback.
 - **Heal after a long partition:** the side holding the lowest peer id keeps its state. A peer hearing from a peer

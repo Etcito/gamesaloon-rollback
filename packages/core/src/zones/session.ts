@@ -27,6 +27,10 @@ import type { ZControlMsg, ZDesyncMsg, ZDomainSnapshotMsg, ZInputMsg, ZShadowMsg
 
 export type { FarSink } from './far.ts'
 
+/** Silence after which a heard peer gets the reliable frames of the gap again: the longer of these two. */
+const DEFAULT_RESEND_SILENCE_MS = 100
+const DEFAULT_RESEND_SILENCE_TICKS = 4
+
 export interface ZoneSessionConfig<TInput>
   extends Pick<RollbackTuning, 'tickRate' | 'maxPrediction' | 'minDelay' | 'maxDelay' | 'delayHiddenTicks' | 'lostAfterMs' | 'dropWaitMs'> {
   localPeer: number
@@ -45,6 +49,8 @@ export interface ZoneSessionConfig<TInput>
   botInput?: (seat: SeatId, tick: number, out: TInput) => void
   onSleep?: (domain: DomainId, id: number, tick: number, asleep: boolean) => void
   farSink?: FarSink
+  /** Silence from a peer after which its next message triggers a resend of CONTROL and SHADOW. Default: max(4 ticks, 100 ms). */
+  resendSilenceMs?: number
   /** @deprecated Use farSink. */
   far?: FarSink
 }
@@ -94,6 +100,10 @@ export interface DomainState<TInput> {
   readonly peers: number[]
   /** Per peer, the highest contiguous tick of the local seats it acknowledged for this domain, or start - 1. */
   readonly peerAck: Int32Array
+  /** Per peer, the highest tick it reported confirmed in its checks, or -1: the resend after silence starts past it. */
+  readonly peerConfirmed: Int32Array
+  /** Per peer, the rejoin boundary its rejoin snapshot of this state was sent for, or -1. */
+  readonly rejoinSent: Float64Array
   /** First tick this state steps: 0, or the boundary S it was created at. */
   readonly start: number
   /** First tick it no longer steps: Infinity, or the boundary that replaced it (it is then kept for the grace). */
@@ -160,6 +170,13 @@ export class ZoneSession<TInput> {
   private readonly lastNews = new Float64Array(MAX_PEERS)
   private readonly lost = new Uint8Array(MAX_PEERS)
   private readonly rejoinAt = new Float64Array(MAX_PEERS).fill(Infinity)
+  /** Peers owed a rejoin snapshot of each state this peer produces. */
+  private readonly rejoinOwed: number[] = []
+  /** Peers of the local side when it resigned: the established side lost them too, so they rejoin with it. */
+  private readonly mate = new Uint8Array(MAX_PEERS)
+  /** One assembler per sender while awaiting a snapshot. */
+  private readonly observeAsm = new Map<number, SnapshotAssembler>()
+  private readonly resendAfterMs: number
   private readonly roster: Roster
   private readonly bot: TInput
   private farSchedule: FarSchedule
@@ -253,6 +270,7 @@ export class ZoneSession<TInput> {
     this.maxSubsteps = cfg.maxSubsteps ?? Math.ceil(MAX_FRAME_DT * tickRate)
     if (!(Number.isInteger(this.maxSubsteps) && this.maxSubsteps >= 1)) throw new Error('[zones] session: bad maxSubsteps')
     this.maxPrediction = cfg.maxPrediction ?? DEFAULT_MAX_PREDICTION
+    this.resendAfterMs = cfg.resendSilenceMs ?? Math.max(DEFAULT_RESEND_SILENCE_TICKS * 1000 / tickRate, DEFAULT_RESEND_SILENCE_MS)
     const maxDelay = cfg.maxDelay ?? DEFAULT_MAX_DELAY
     validateZoneTuning(cfg.tuning, { maxPrediction: this.maxPrediction, maxDelay })
     if (!(cfg.tuning.snapshotRing > this.maxPrediction)) throw new Error('[zones] session: snapshotRing must exceed maxPrediction')
@@ -423,6 +441,8 @@ export class ZoneSession<TInput> {
       decoded: [],
       peers: spec.replicas.filter((p) => p !== this.cfg.localPeer),
       peerAck: new Int32Array(MAX_PEERS).fill(sim.tick - 1),
+      peerConfirmed: new Int32Array(MAX_PEERS).fill(-1),
+      rejoinSent: new Float64Array(MAX_PEERS).fill(-1),
       start: sim.tick,
       end: Infinity,
       build,
@@ -748,8 +768,14 @@ export class ZoneSession<TInput> {
       }
       switch (m.type) {
         case ZMSG.ZDROP: {
-          const d = this.byId.get(m.domain)
-          if (d && d.spec.replicas.includes(from) && this.isPeer[m.lostPeer] && (d.drops.get(m.lostPeer)?.from === Infinity || this.rejoinAt[m.lostPeer] === Infinity || m.lastTick >= this.rejoinAt[m.lostPeer])) {
+          // An observer's live set is stale until it plays again.
+          if (!this.isPeer[m.lostPeer] || this.observing(from, this.tick)) break
+          // Every state with that id, the grace ones included: an agreement spanning a boundary completes in both.
+          const n = this.list.length
+          for (let k = 0; k < n + this.grace.length; k++) {
+            const d = k < n ? this.list[k] : this.grace[k - n]
+            if (d.spec.id !== m.domain || !d.spec.replicas.includes(from)) continue
+            if (!(d.drops.get(m.lostPeer)?.from === Infinity || this.rejoinAt[m.lostPeer] === Infinity || m.lastTick >= this.rejoinAt[m.lostPeer])) continue
             this.peerLost(m.lostPeer, this.net!.now())
             const drop = d.drops.get(m.lostPeer)
             if (drop) {
@@ -842,6 +868,7 @@ export class ZoneSession<TInput> {
       const c = m.checks[i]
       const x = c.tick < this.limit ? this.stateFor(c.domain, c.tick) : undefined
       if (!x) continue
+      if (c.tick > x.peerConfirmed[m.from]) x.peerConfirmed[m.from] = c.tick
       x.recovery.record(m.from, c.tick, c.hash)
       this.checkTick(x, c.tick)
     }
@@ -865,7 +892,9 @@ export class ZoneSession<TInput> {
       this.stats.malformed++
       return
     }
+    // A rejoining peer's frames come from its stale side of a split.
     for (let i = 0; i < m.count; i++) {
+      if (this.observing(m.from, m.firstTick + i)) continue
       const d = this.stateFor(m.toDomain, m.firstTick + i)
       if (d) this.storeShadow(d, m.fromDomain, m.firstTick + i, m.payloads[i])
     }
@@ -876,27 +905,16 @@ export class ZoneSession<TInput> {
    * DOMAIN_SNAPSHOT from the producer is its correction of this replica after a disagreement.
    */
   private onSnapshot(m: ZDomainSnapshotMsg): void {
+    if (this.awaitingSnapshot) {
+      this.observe(m)
+      return
+    }
     const n = this.stateFor(m.domain, m.tick)
     if (!n) return
     if (n.build === null || n.start !== m.tick) {
       if (m.from !== this.producerOf(n) || n.producer) return
       const done = n.fixAsm.push(m as unknown as SnapshotMsg)
-      if (done) {
-        n.fix = done
-        if (this.observing(this.cfg.localPeer, this.tick)) {
-          this.tick = Math.max(this.tick, done.tick)
-          this.nextEpoch = Math.floor(this.tick / this.tuning.epochTicks) + 1
-          this.limit = this.nextEpoch * this.tuning.epochTicks
-          if (this.awaitingSnapshot) this.rejoinAt[this.cfg.localPeer] = this.limit
-          this.awaitingSnapshot = false
-          this.roster.live[this.cfg.localPeer] = true
-          this.lost[this.cfg.localPeer] = 0
-          for (const buf of n.inputs.buffers) buf.lastTick = Math.max(buf.lastTick, done.tick - 1)
-          for (const sh of n.inputs.shadows) sh.lastTick = Math.max(sh.lastTick, done.tick - 1)
-          for (const buf of this.localBufs) buf.lastTick = Math.max(buf.lastTick, done.tick - 1)
-          this.controlSent = Math.max(this.controlSent, done.tick - 1)
-        }
-      }
+      if (done) n.fix = done
       return
     }
     const b = n.build
@@ -915,6 +933,67 @@ export class ZoneSession<TInput> {
     else this.stats.malformed++
   }
 
+  /**
+   * A rejoin snapshot reaching an observer. Its tick lies in the epoch before the established side's rejoin boundary,
+   * so adopting that epoch's assignment puts both sides on the same next boundary. The sender must be that epoch's
+   * producer of the domain, recomputed with assign(); without the epoch's CONTROL samples, the lowest live peer.
+   */
+  private observe(m: ZDomainSnapshotMsg): void {
+    let asm = this.observeAsm.get(m.from)
+    if (!asm) this.observeAsm.set(m.from, asm = new SnapshotAssembler())
+    const done = asm.push(m as unknown as SnapshotMsg)
+    if (!done) return
+    const local = this.cfg.localPeer
+    const E = Math.floor(done.tick / this.tuning.epochTicks)
+    // The established side planned that epoch without the local side.
+    const roster: Roster = { ...this.roster, live: this.roster.live.slice() }
+    let lowest = -1
+    for (let p = 0; p < roster.live.length; p++) {
+      roster.live[p] = this.isPeer[p] === 1 && p !== local && !this.mate[p] && !this.lost[p] && this.roster.live[p] === true
+      if (roster.live[p] && lowest < 0) lowest = p
+    }
+    for (let s = 0; s < this.seatOwner.length; s++) this.controls.expect(s, roster.live[this.seatOwner[s]] === true)
+    const held = this.controls.ready(E)
+    const sample = this.controls.sample(E)
+    const a = assign(roster, { epoch: E, words: sample.words.slice() }, this.current, this.tuning)
+    const spec = a.domains.find((x) => x.id === m.domain)
+    const producer = spec ? spec.replicas.find((p) => roster.live[p]) : undefined
+    if (held ? m.from !== producer : m.from !== lowest) return
+    this.adopt(a, done.tick)
+  }
+
+  /** Drops every stale state and plays on from the adopted assignment; the local side's seats switch at its next boundary. */
+  private adopt(a: Assignment, tick: number): void {
+    const local = this.cfg.localPeer
+    for (const d of this.list) delete this.stats.confirmedTick[d.spec.id]
+    for (const d of this.grace) delete this.stats.confirmedTick[d.spec.id]
+    this.list.length = this.grace.length = this.owed.length = 0
+    this.byId.clear()
+    this.shadowOut.clear()
+    this.corrupt.clear()
+    this.observeAsm.clear()
+    this.early = []
+    this.prevAssign = null
+    this.current = a
+    this.farSchedule.rebuild(a, this.roster, { epoch: a.epoch, words: this.lastControl })
+    this.nextEpoch = a.epoch + 1
+    this.limit = this.nextEpoch * this.tuning.epochTicks
+    if (tick > this.tick) this.tick = tick
+    // The skipped local ticks are never sampled: buffers and CONTROL resume past them.
+    for (const buf of this.localBufs) if (buf.lastTick < tick - 1) buf.lastTick = tick - 1
+    if (this.controlSent < tick - 1) this.controlSent = tick - 1
+    this.awaitingSnapshot = false
+    for (let p = 0; p < MAX_PEERS; p++) {
+      if (p !== local && !this.mate[p]) continue
+      this.mate[p] = 0
+      this.lost[p] = 0
+      this.roster.live[p] = true
+      this.rejoinAt[p] = this.limit
+    }
+    // The local side was not live in that epoch, so it replicates none of its domains: no state to build here.
+    this.bindLocal()
+  }
+
   private storeShadow(d: DomainState<TInput>, from: DomainId, t: number, data: Uint8Array): void {
     const r = d.inputs.setShadow(from, t, data)
     if (r < d.sim.tick && r < d.rollbackTick) d.rollbackTick = r
@@ -922,6 +1001,7 @@ export class ZoneSession<TInput> {
 
   private send(_now: number): void {
     this.sendControl()
+    if (this.rejoinOwed.length !== 0) this.sendRejoin()
     const n = this.list.length
     for (let i = 0; i < n + this.grace.length; i++) {
       const d = i < n ? this.list[i] : this.grace[i - n]
@@ -969,16 +1049,22 @@ export class ZoneSession<TInput> {
 
   /** The local seats' control words of every tick stored since the last send, to every other peer. */
   private sendControl(): void {
+    if (this.localSeats.length === 0 || this.others.length === 0) return
+    const last = this.localBufs[0].lastTick
+    if (this.controlSent < last) this.controlOut(this.controlSent + 1, last, -1)
+    if (last > this.controlSent) this.controlSent = last
+  }
+
+  /** CONTROL of ticks first..last of the local seats, to one peer or (to < 0) to every other peer. */
+  private controlOut(first: number, last: number, to: number): void {
     const seats = this.localSeats
     const ns = seats.length < MAX_WIRE_PLAYERS ? seats.length : MAX_WIRE_PLAYERS
-    if (ns === 0 || this.others.length === 0) return
-    const last = this.localBufs[0].lastTick
+    if (ns === 0) return
     const m = this.ctlOut
     m.from = this.cfg.localPeer
     m.seats = ns
     for (let j = 0; j < ns; j++) m.seatIds[j] = seats[j]
-    while (this.controlSent < last) {
-      const first = this.controlSent + 1
+    while (first <= last) {
       let count = last - first + 1
       if (count > MAX_WIRE_TICKS) count = MAX_WIRE_TICKS
       for (let t = 0; t < count; t++) {
@@ -986,8 +1072,9 @@ export class ZoneSession<TInput> {
       }
       m.firstTick = first
       m.count = count
-      this.fanOut(this.others, 'reliable', this.writer.control(m))
-      this.controlSent = first + count - 1
+      if (to < 0) this.fanOut(this.others, 'reliable', this.writer.control(m))
+      else this.net!.send(to, 'reliable', this.writer.control(m))
+      first += count
     }
   }
 
@@ -1172,8 +1259,9 @@ export class ZoneSession<TInput> {
     const prevById = new Map(prev.domains.map((s) => [s.id, s]))
     for (const spec of next.domains) {
       if (spec.replicas.indexOf(local) < 0) continue
-      if (cont.has(spec.id)) {
-        this.byId.get(spec.id)!.spec = spec
+      const kept = cont.has(spec.id) ? this.byId.get(spec.id) : undefined
+      if (kept) {
+        kept.spec = spec
         continue
       }
       const r = plan.rebuild.find((x) => x.domain === spec.id)
@@ -1494,8 +1582,11 @@ export class ZoneSession<TInput> {
         seen[this.cfg.localPeer] = 1
         agreement.report(this.cfg.localPeer, last)
         d.drops.set(peer, { agreement, seen, since: now, from: Infinity })
-        this.fanOut(d.peers, 'reliable', this.writer.drop(this.cfg.localPeer, d.spec.id, peer, last))
-        this.dropTail(d, peer)
+        // The others agree on the local peer's drop without it; its own report would be ignored.
+        if (peer !== this.cfg.localPeer) {
+          this.fanOut(d.peers, 'reliable', this.writer.drop(this.cfg.localPeer, d.spec.id, peer, last))
+          this.dropTail(d, peer)
+        }
       }
       const producer = this.producerOf(d) === this.cfg.localPeer
       if (producer && !d.producer) {
@@ -1575,22 +1666,121 @@ export class ZoneSession<TInput> {
 
   private news(peer: number): void {
     const now = this.net!.now()
+    const silent = now - this.lastNews[peer] > this.resendAfterMs
     this.lastNews[peer] = now
-    if (!this.lost[peer]) return
+    const back = this.lost[peer] !== 0
+    if (back) this.heard(peer)
+    if (silent || back) this.resend(peer)
+  }
+
+  /**
+   * A peer marked lost is heard again. A lower id than the whole local live set means the local side lost the split:
+   * it resigns and resyncs as an observer. Otherwise the peer rejoins as an observer until the next boundary.
+   */
+  private heard(peer: number): void {
+    const local = this.cfg.localPeer
+    if (!this.awaitingSnapshot) {
+      let lowest = local
+      for (let p = 0; p < local && lowest === local; p++) if (this.isPeer[p] && this.roster.live[p] && !this.lost[p]) lowest = p
+      if (peer < lowest) {
+        for (const p of this.others) if (this.roster.live[p] && !this.lost[p]) this.mate[p] = 1
+        this.peerLost(local, this.net!.now())
+      }
+    }
     this.lost[peer] = 0
     this.roster.live[peer] = true
-    this.rejoinAt[peer] = this.limit
     const at = this.stats.lostPeers.indexOf(peer)
     if (at >= 0) this.stats.lostPeers.splice(at, 1)
+    // An observer hears the established side: those peers play on.
+    if (this.awaitingSnapshot) {
+      this.rejoinAt[peer] = Infinity
+      this.mate[peer] = 0
+      return
+    }
+    this.rejoinAt[peer] = this.limit
+    if (this.rejoinOwed.indexOf(peer) < 0) this.rejoinOwed.push(peer)
     for (const d of this.list) {
-      if (!d.peers.includes(peer)) d.peers.push(peer)
+      if (d.spec.replicas.includes(peer) && !d.peers.includes(peer)) d.peers.push(peer)
       for (const link of this.shadowOut.get(d) ?? []) {
-        if (!link.peers.includes(peer)) link.peers.push(peer)
-        link.sent = Math.max(d.start - 1, d.confirmed - this.maxPrediction)
+        const to = this.current.domains.find((x) => x.id === link.to)
+        if (to && to.replicas.includes(peer) && !link.peers.includes(peer)) link.peers.push(peer)
       }
-      if (!d.producer) continue
-      const bytes = d.ring.bytesAt(d.confirmed)
-      if (bytes) for (const part of this.writer.domainSnapshotParts(this.cfg.localPeer, d.spec.id, d.confirmed, bytes)) this.net!.send(peer, 'reliable', part)
+    }
+  }
+
+  /**
+   * Reliable frames sent during a silence may be lost: the local seats' CONTROL and, as producer, each link's SHADOW
+   * go again to this peer alone, from past the tick it last reported confirmed, else from the oldest retained tick.
+   * They precede this frame's regular sends, so the reliable order holds; duplicates store idempotently.
+   */
+  private resend(peer: number): void {
+    if (this.awaitingSnapshot) return
+    if (this.localSeats.length !== 0) {
+      const last = this.controlSent
+      const g = this.byId.get(this.current.domains[0].id)
+      const oldest = this.localBufs[0].lastTick - this.controls.size + 1
+      let first = g && g.spec.kind === 'global' ? g.peerConfirmed[peer] + 1 : 0
+      if (first < oldest) first = oldest
+      if (first < 0) first = 0
+      if (first <= last) this.controlOut(first, last, peer)
+    }
+    const n = this.list.length
+    for (let i = 0; i < n + this.grace.length; i++) {
+      const d = i < n ? this.list[i] : this.grace[i - n]
+      const links = this.shadowOut.get(d)
+      if (!d.producer || !links) continue
+      for (let k = 0; k < links.length; k++) {
+        const link = links[k]
+        if (link.peers.indexOf(peer) < 0) continue
+        const target = this.byId.get(link.to)
+        let first = target ? target.peerConfirmed[peer] + 1 : 0
+        if (first < d.start) first = d.start
+        while (first <= link.sent && !link.holds(first)) first++
+        this.shadowRange(d, link, first, link.sent, peer)
+      }
+    }
+  }
+
+  /** SHADOW of ticks first..last of one link, to one peer. */
+  private shadowRange(d: DomainState<TInput>, link: ShadowOutRing, first: number, last: number, to: number): void {
+    const out = this.shadowPayloads
+    while (first <= last) {
+      let count = last - first + 1
+      if (count > MAX_WIRE_TICKS) count = MAX_WIRE_TICKS
+      out.length = count
+      for (let i = 0; i < count; i++) out[i] = link.payload(first + i)
+      const data = this.writer.shadow(this.cfg.localPeer, d.spec.id, link.to, first, out)
+      if (data) this.net!.send(to, 'reliable', data)
+      first += count
+    }
+  }
+
+  /**
+   * A rejoining peer adopts the epoch of the snapshot tick, so every state this peer produces sends it its newest
+   * retained snapshot of the epoch before the rejoin boundary R, once confirmed reaches that epoch.
+   */
+  private sendRejoin(): void {
+    const K = this.tuning.epochTicks
+    for (let i = this.rejoinOwed.length - 1; i >= 0; i--) {
+      const peer = this.rejoinOwed[i], R = this.rejoinAt[peer]
+      let pending = false
+      const n = this.list.length
+      for (let k = 0; R !== Infinity && this.tick < R && k < n + this.grace.length; k++) {
+        const d = k < n ? this.list[k] : this.grace[k - n]
+        const lo = d.start > R - K ? d.start : R - K
+        if (!d.producer || d.rejoinSent[peer] === R || d.end <= lo || d.start >= R) continue
+        if (d.confirmed < lo) {
+          pending = true
+          continue
+        }
+        d.rejoinSent[peer] = R
+        let t = d.confirmed < R - 1 ? d.confirmed : R - 1
+        if (t > d.end - 1) t = d.end - 1
+        while (t >= lo && !d.ring.bytesAt(t)) t--
+        const bytes = t >= lo ? d.ring.bytesAt(t) : null
+        if (bytes) for (const part of this.writer.domainSnapshotParts(this.cfg.localPeer, d.spec.id, t, bytes)) this.net!.send(peer, 'reliable', part)
+      }
+      if (!pending) this.rejoinOwed.splice(i, 1)
     }
   }
 
@@ -1736,6 +1926,10 @@ class ShadowOutRing {
     for (let i = 0; i < n; i++) dst[i] = src[i]
     this.lens[s] = n
     this.ticks[s] = tick
+  }
+
+  holds(tick: number): boolean {
+    return this.ticks[tick % this.ticks.length] === tick
   }
 
   /** The payload of a tick, or an empty one when it is no longer held. */
