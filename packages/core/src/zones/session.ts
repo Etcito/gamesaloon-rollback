@@ -165,7 +165,8 @@ export class ZoneSession<TInput> {
   private readonly eventReader = new FarReader()
   private readonly lastControl: Uint32Array
   private readonly controlFields = { cell: 0, cpuClass: 0, bwClass: 0, latClass: 0, spareSlots: 0 }
-  private readonly sleepTables = new Map<DomainId, SleepWakeDedupe>()
+  private readonly sleepTables = new Map<DomainId, { dedupe: SleepWakeDedupe; poses: Map<number, SleepPose> }>()
+  private readonly sleepPeers: number[] = []
   private net: GroupTransport | null
   private readonly cfg: ZoneSessionConfig<TInput>
   private readonly codec: InputCodec<TInput>
@@ -586,8 +587,13 @@ export class ZoneSession<TInput> {
     const log = d.sleepLog
     const last = Math.min(d.inputs.frontier(), d.sim.tick - 1, c, d.rollbackTick - 1)
     for (let tick = log.sent + 1; tick <= last; tick++) {
-      const r = this.eventReader.bind(log.payload(tick))
-      while (r.remaining) this.recordSleep(d.spec.id, r.u32(), r.i32(), r.bool(), d.producer)
+      const bytes = log.payload(tick), r = this.eventReader.bind(bytes)
+      while (r.remaining) {
+        const id = r.u32(), at = r.i32(), asleep = r.bool(), length = r.u32()
+        const offset = bytes.length - r.remaining
+        for (let i = 0; i < length; i++) r.u8()
+        this.recordSleep(d.spec.id, id, at, asleep, bytes, d.producer ? d : null, offset, length)
+      }
       log.sent = tick
     }
     if (c > d.confirmed) {
@@ -750,7 +756,8 @@ export class ZoneSession<TInput> {
         case ZMSG.SLEEP:
         case ZMSG.WAKE: {
           const d = this.stateFor(m.domain, m.tick)
-          if (!d || from === this.producerOf(d)) this.recordSleep(m.domain, m.id, m.tick, m.type === ZMSG.SLEEP, false)
+          if (!d || from === this.producerOf(d)) this.recordSleep(m.domain, m.id, m.tick,
+            m.type === ZMSG.SLEEP, m.type === ZMSG.SLEEP ? m.pose : EMPTY_BYTES, null)
           break
         }
         case ZMSG.FAR: {
@@ -1104,6 +1111,9 @@ export class ZoneSession<TInput> {
       w.u32(out[i].id)
       w.i32(out[i].tick)
       w.bool(out[i].asleep)
+      const pose = out[i].asleep ? out[i].pose : EMPTY_BYTES
+      w.u32(pose.length)
+      for (let j = 0; j < pose.length; j++) w.u8(pose[j])
     }
     d.sleepLog.store(t, w)
   }
@@ -1562,17 +1572,34 @@ export class ZoneSession<TInput> {
     }
   }
 
-  private recordSleep(domain: DomainId, id: number, tick: number, asleep: boolean, send: boolean): void {
+  /** Table-owned pose view, valid until the next message; null after WAKE or before the first SLEEP. */
+  sleepPoseOf(domain: DomainId, id: number): Uint8Array | null {
+    return this.sleepTables.get(domain)?.poses.get(id)?.pose ?? null
+  }
+
+  private recordSleep(domain: DomainId, id: number, tick: number, asleep: boolean, bytes: Uint8Array,
+    producer: DomainState<TInput> | null, offset = 0, length = bytes.length): void {
     let table = this.sleepTables.get(domain)
-    if (!table) this.sleepTables.set(domain, table = new SleepWakeDedupe(domain))
+    if (!table) this.sleepTables.set(domain, table = { dedupe: new SleepWakeDedupe(domain), poses: new Map() })
     // Register only on first sight; the recovery table retains (id, tick, state) thereafter.
-    table.register(id)
-    if (!table.record(id, tick, asleep)) return
+    table.dedupe.register(id)
+    if (!table.dedupe.record(id, tick, asleep)) return
+    let entry = table.poses.get(id)
+    if (!entry) table.poses.set(id, entry = new SleepPose())
+    const pose = entry.record(asleep, bytes, offset, length)
     this.stats.sleepTransitions++
     this.cfg.onSleep?.(domain, id, tick, asleep)
-    if (send) this.fanOut(this.others, 'reliable', asleep
-      ? this.writer.sleep(this.cfg.localPeer, domain, id, tick, EMPTY_BYTES)
-      : this.writer.wake(this.cfg.localPeer, domain, id, tick))
+    const sink = this.cfg.farSink ?? this.cfg.far
+    sink?.sleep?.(domain, id, tick, asleep, pose)
+    if (producer) {
+      this.sleepPeers.length = 0
+      for (const peer of this.others) {
+        if (this.roster.live[peer] && !producer.spec.replicas.includes(peer)) this.sleepPeers.push(peer)
+      }
+      this.fanOut(this.sleepPeers, 'reliable', asleep
+        ? this.writer.sleep(this.cfg.localPeer, domain, id, tick, pose)
+        : this.writer.wake(this.cfg.localPeer, domain, id, tick))
+    }
   }
 
   private updateDelay(_now: number): number { return this.delayCtl.current }
@@ -1626,6 +1653,27 @@ function wiring(a: Assignment, id: DomainId): string {
 }
 
 const EMPTY_BYTES = new Uint8Array(0)
+
+/** Retains storage across WAKE; repeated pose lengths reuse their views. */
+class SleepPose {
+  pose: Uint8Array | null = null
+  private bytes = EMPTY_BYTES
+  private readonly views: (Uint8Array | undefined)[] = []
+
+  record(asleep: boolean, source: Uint8Array, offset: number, length: number): Uint8Array {
+    if (!asleep) {
+      this.pose = null
+      return EMPTY_BYTES
+    }
+    if (this.bytes.length < length) {
+      this.bytes = new Uint8Array(length)
+      this.views.length = 0
+    }
+    for (let i = 0; i < length; i++) this.bytes[i] = source[offset + i]
+    this.pose = this.views[length] ?? (this.views[length] = this.bytes.subarray(0, length))
+    return this.pose
+  }
+}
 
 /** The payloads one produced domain sends over one link, by tick. Slots only grow and their views are cached. */
 class ShadowOutRing {
