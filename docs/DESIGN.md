@@ -5,6 +5,8 @@ and one open design question (interest management). The origin of the code is in
 
 ## 1. What it does
 
+Rollback by zones (per-domain sessions for large matches) is described in [`ZONES.md`](ZONES.md).
+
 Every peer runs the whole simulation locally at a fixed tick rate. A peer never waits for the network to advance:
 
 1. The local input is sampled each tick and scheduled `delay` ticks in the future (input delay).
