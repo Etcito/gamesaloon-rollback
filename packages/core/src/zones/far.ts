@@ -109,6 +109,8 @@ export class FarReader {
  */
 export interface FarSink {
   far(domain: DomainId, tick: number, stride: number, n: number, entries: FarReader): void
+  /** Display-only transition. Pose is valid during this call and empty for WAKE; never feed it into a step. */
+  sleep?(domain: DomainId, id: number, tick: number, asleep: boolean, pose: Uint8Array): void
 }
 
 /**

@@ -72,6 +72,8 @@ export interface SleepEvent {
   readonly id: number
   readonly tick: number
   readonly asleep: boolean
+  /** Snapshot-form quantized pose; empty for WAKE. Domain-owned, valid until the next step or restore. */
+  readonly pose: Uint8Array
 }
 
 /**
@@ -101,6 +103,8 @@ export interface DomainSim<TInput> {
   seatHost(seat: SeatId, peer: number, bot: boolean): void
   /** Fills the caller-owned `out` with the sleep and wake transitions of this tick. */
   sleepEvents(out: SleepEvent[]): void
+  /** Writes the entity's quantized snapshot-form pose; false when this domain does not hold it. */
+  sleepPose(id: number, w: SnapWriter): boolean
   /** Called before a resimulation starts: mute view events. */
   beginResim?(): void
   /** Called after the resimulation; always paired with beginResim. */
