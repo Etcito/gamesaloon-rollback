@@ -43,8 +43,11 @@ Classes come from measurements through the tuning threshold tables (`classOf`).
    chunks become shadow links in both directions.
 5. Domain ids: global = 0, seat domain = 1 + lowest seat, field domain = 1 + seatCount + cell. Ascending id order
    is canonical.
-6. Replicas: the owners of member seats, then weighted rendezvous up to `replicas` (or `untouchedReplicas`). The
-   producer is the top-scored replica. Every live peer replicates the global domain.
+6. Replicas: the live owners of member seats, then weighted rendezvous up to `replicas` (or `untouchedReplicas`).
+   The score is `(fnv1a32(u16 domainId, u8 peer) >>> 8) * weight`, where
+   `weight = capacityByCpuClass[cpuClass] * spareSlots`. Sort by descending score, ties to the lower peer id.
+   Zero-weight peers only replicate when they own member seats. The producer is the first replica.
+   Every live peer replicates the global domain.
 7. Seat host: the owning peer if live, else `seatHostFor` over the live replicas, which drives a bot.
 
 ## Wire
@@ -54,19 +57,26 @@ Byte 0 is the type, byte 1 the sender peer. Little-endian, ticks i32, domain ids
 
 | Type | Name | Layout | Channel, audience |
 |---|---|---|---|
-| 16 | CONTROL | firstTick, count u8, seats u8, seat u16[], words u32[] | unreliable, all live peers |
+| 16 | CONTROL | firstTick, count u8, seats u8, seat u16[], words u32[] | reliable, all other roster peers |
 | 17 | ZINPUT | domain, ackTick, firstTick, count u8, seats u8, seat u16[], codes, senderTick, nChecks u8, (domain u16, tick, hash)[] | unreliable, replicas |
 | 18 | DOMAIN_SNAPSHOT | domain, tick, part u16, parts u16, total u32, fnv u32, bytes (chunked at `SNAPSHOT_CHUNK`) | reliable, new replica or observer |
 | 19 | FAR | domain, tick, stride u8, n u16, entries | unreliable, live non-replicas |
-| 20 | SHADOW | fromDomain, toDomain, firstTick, count u8, (u16 length + bytes)[] | unreliable, target replicas |
-| 21 | SLEEP | domain, id u32, tick, pose (rest of the frame) | reliable, live non-replicas |
-| 22 | WAKE | domain, id u32, tick | reliable, live non-replicas |
+| 20 | SHADOW | fromDomain, toDomain, firstTick, count u8, (u16 length + bytes)[] | reliable, target replicas |
+| 21 | SLEEP | domain, id u32, tick, quantized snapshot-form pose from `SleepEvent.pose` / `DomainSim.sleepPose` (rest of the frame) | reliable, producer to live non-replicas, once per confirmed asleep transition |
+| 22 | WAKE | domain, id u32, tick | reliable, producer to live non-replicas, once per confirmed awake transition |
 | 23 | ZDROP | domain, lostPeer u8, lastTick | reliable, replicas |
 | 24 | ZDESYNC | domain, tick, hash | reliable, replicas |
 
 SLEEP carries the body's quantized pose: the pose fields of that entity's record in `snapshot()`, at the transition
 tick. The producer takes it from `SleepEvent.pose`, which equals the bytes `DomainSim.sleepPose(id, w)` writes for
-that entity, so it is a pure function of the simulation. WAKE has no pose.
+that entity, so it is a pure function of the simulation. WAKE has no pose. Neither message is sent during
+resimulation or changes replica state. Receivers accept any pose length (including 0), retain it in a per-domain
+sleep table exposed by `ZoneSession.sleepPoseOf` and notify `FarSink.sleep`. WAKE clears it. A display shows the
+sleeper at that pose until WAKE; awake poses come from FAR or DOMAIN_SNAPSHOT.
+
+`SleepEvent.pose` is preallocated domain-owned storage, valid until the next `step()` or `restore()`.
+`DomainSim.sleepPose(id, w)` returns false when the domain does not hold the entity. The pose encoder is shared
+with the asleep transition so the bytes agree; the snapshot format, hash and sleep digest are unchanged.
 
 ## Epoch
 
@@ -95,25 +105,44 @@ rollback follows.
 - **Drop:** a silent peer is lost after the core lost timeout. Replicas of each affected domain exchange ZDROP with
   the last tick of its seats; S = max. From S+1 `seatHost(seat, botHost, true)` applies, and the bot host drives the
   seat after `botTakeoverMs` without news. Bot inputs (`botInput`) travel as normal ZINPUT. `onPeerLost(peer, tick)`
-  reports it.
+  reports it. The roster's `live` flag changes for the next assignment. `lostAfterMs` and `dropWaitMs` in the
+  session config override the core timing defaults. ZDROP reports apply to every state with that domain id,
+  including states kept during handoff grace, so an agreement spanning a boundary can complete.
 - **Rejoin:** a returning peer is an observer (its control words carry `CONTROL_NO_CELL`), receives DOMAIN_SNAPSHOT
   for its assigned domains, and its seats switch back at the next epoch boundary with `seatHost(seat, peer, false)`.
-  The `observer` config flag starts a late rejoin that way.
+  The `observer` config flag starts a late rejoin that way. Each producer sends the returning peer its newest
+  retained snapshot at or below confirmed for every current and grace state it produces, unless none is retained.
+  An observer awaiting a snapshot accepts the producer for the snapshot tick's epoch, recomputed with `assign`
+  from that epoch's CONTROL samples and roster. Until those samples are available, it accepts a complete snapshot
+  from the lowest-id live replica it has heard from. It adopts that epoch's assignment and switches to seated play
+  at the next epoch boundary.
+- **Resend after silence:** after more than `max(4 tick durations, 100 ms)` without news from a peer, its next frame
+  rewinds its resend cursors. CONTROL and the producer's SHADOW frames are resent directly to it, reliably and in
+  order, from its last reported confirmed tick plus one; CONTROL uses the global domain's confirmed tick.
+  When that tick is unknown, start at the oldest retained tick. Duplicates are harmless: identical words or shadow
+  payloads are stored idempotently and schedule no rollback.
+- **Heal after a long partition:** the side holding the lowest peer id keeps its state. A peer hearing from a peer
+  it marked lost whose id is lower than the lowest id of its own live set (itself included) resigns and becomes an
+  observer. The losing side's peers resync through DOMAIN_SNAPSHOT as above and switch at the next epoch boundary.
 - **SLEEP and WAKE:** only the producer sends them, from `sleepEvents(out)` of confirmed steps, never during
-  resimulation. It sends exactly one reliable SLEEP (with `ev.pose`) and one reliable WAKE per confirmed transition,
-  to the live peers outside the replica set (the FAR audience), with `sendMany` when available.
+  resimulation. Recovery dedupe ensures exactly one reliable SLEEP per confirmed asleep transition, with `ev.pose`,
+  and one reliable WAKE per confirmed awake transition, to the live peers outside the replica set (the FAR audience),
+  with `sendMany` when available. SLEEP carries the body's quantized pose: the pose fields of its snapshot record,
+  from `SleepEvent.pose`, identical to the bytes `DomainSim.sleepPose` writes at that transition.
 - **Receiving SLEEP:** any pose length is accepted, including 0, and nothing throws. The pose is copied into a
   per-domain sleep table (reused storage that grows only for larger poses), readable with
   `ZoneSession.sleepPoseOf(domain, id)` until the next message, and handed to the optional
-  `FarSink.sleep?(domain, id, tick, asleep, pose)`. WAKE clears the entry and passes a zero-length pose. A display
-  shows a sleeper at that pose until WAKE, because a sleeping body leaves the FAR stream.
+  `FarSink.sleep?(domain, id, tick, asleep, pose)` (view valid during the call). WAKE clears the entry and passes a
+  zero-length pose. A display shows a sleeper at that pose until WAKE, because a sleeping body leaves the FAR stream.
 - **SLEEP and WAKE never change replica state:** replicas simulate sleep deterministically, and the hash's sleep
   digest covers it. Awake poses come from FAR or DOMAIN_SNAPSHOT.
-- **FAR** is display only: it goes to `config.farSink` and never enters a step.
+- **FAR:** the producer sends to live peers outside the replica set at `farStride(distance, tuning)`, writing
+  `sim.far(w, stride)`. Distance is the closest Chebyshev cell distance between the peer's seats and the domain.
+  FAR is display only: it goes to `config.farSink` and never enters a step.
 
 ## Tuning
 
-Every number is a `ZoneTuning` field; `ZONE_DEFAULTS` holds the defaults and `validateZoneTuning` refuses invalid
+Zone limits are `ZoneTuning` fields; `ZONE_DEFAULTS` holds the defaults and `validateZoneTuning` refuses invalid
 sets. All peers use identical tuning; `tuningHash` goes into the room payload.
 
 | Field | Default | Meaning |
@@ -131,3 +160,5 @@ sets. All peers use identical tuning; `tuningHash` goes into the room payload.
 | `botTakeoverMs` | 150 | silence before the bot host drives |
 | `snapshotRing` | 40 | snapshot ring per domain |
 | `keyframeEvery` | 1 | epochs between agreed keyframes |
+| `gridCols` | 256 | columns used to decode cell ids |
+| `fieldCells` | [] | ascending cells containing untouched interactive areas |
