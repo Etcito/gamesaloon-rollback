@@ -45,7 +45,8 @@ function prevDomainOf(prev: Assignment | null, seat: SeatId): DomainId {
 /**
  * Per seat, the root (lowest seat id) of its near component, or -1 for an observer. An edge enters at rEnter and
  * stays up to rExit between seats prev had connected (same domain or a shadow link), so a seat on the boundary does
- * not flap. A locked seat never crosses into another prev domain, and two locked domain-mates stay together.
+ * not flap. A locked seat never crosses into another prev domain, and a seat under residence keeps its prev
+ * domain-mates joined even when they are unlocked.
  */
 export function nearComponents(
   cells: ArrayLike<number>,
@@ -70,7 +71,7 @@ export function nearComponents(
       // Residence only means something against a prev assignment.
       if (prev !== null && (lockA || lockB)) {
         if (domA !== domB) continue
-        if (lockA && lockB && domA >= 0) {
+        if (domA >= 0) {
           union(parent, a, b)
           continue
         }

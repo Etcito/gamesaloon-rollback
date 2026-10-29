@@ -47,7 +47,7 @@ test('zone near graph: residence lock holds a seat in its prev domain', () => {
   assert.deepEqual([...nearComponents(cells, prev, Uint8Array.from([0, 1]), tuning)], [0, 1])
   const apart = [cellAt(0, 0), cellAt(0, 5)]
   assert.deepEqual([...nearComponents(apart, prevOf([1, 1]), Uint8Array.from([1, 1]), tuning)], [0, 0])
-  assert.deepEqual([...nearComponents(apart, prevOf([1, 1]), Uint8Array.from([1, 0]), tuning)], [0, 1])
+  assert.deepEqual([...nearComponents(apart, prevOf([1, 1]), Uint8Array.from([1, 0]), tuning)], [0, 0])
 })
 
 test('zone near graph: observers get -1 and never join', () => {
