@@ -102,6 +102,10 @@ export interface DomainState<TInput> {
   build: DomainBuild<TInput> | null
   /** Confirmed hashes of every replica, agreement, keyframes and the cost-class decision. */
   readonly recovery: DomainRecovery
+  /** Agreed snapshot to retain outside check recording; -1 when none is pending. */
+  keyframeAt: number
+  /** Last tick announced reliably, including while waiting for the remaining replica hashes. */
+  announcedTick: number
   /** Earliest disagreement seen since the last recover(), Infinity when none. */
   desyncAt: number
   /** Tick of the last episode entered, or -1. */
@@ -174,7 +178,7 @@ export class ZoneSession<TInput> {
   private readonly fixedDt: number
   private readonly maxSubsteps: number
   private readonly maxPrediction: number
-  /** Ring length of every seat, control and shadow input: a rollback over the ring, prediction and delay ahead, the lead back. */
+  /** Retains a full keyframe interval plus check latency, prediction, delay and assignment lead. */
   private readonly inputCapacity: number
   private acc = 0
   private tick = 0
@@ -229,7 +233,7 @@ export class ZoneSession<TInput> {
   private readonly shadowOut = new Map<DomainState<TInput>, ShadowOutRing[]>()
   private readonly shadowW = new SnapWriter()
   private readonly shadowPayloads: Uint8Array[] = []
-  /** Checks per ZINPUT: each retained hash goes out again within maxPrediction sends, so a lost one is resent. */
+  /** Checks per ZINPUT, sized from prediction and bounded by the wire's u8 count; lost checks rotate out again. */
   private readonly checkCap: number
   private readonly checkPool: HashCheck[] = []
   private readonly desyncPeers: number[] = []
@@ -271,8 +275,8 @@ export class ZoneSession<TInput> {
       for (const s of p.seats) if (s >= 0 && s < roster.seatCount) this.seatOwner[s] = p.peer
     }
     this.others.sort((a, b) => a - b)
-    this.inputCapacity = cfg.tuning.snapshotRing + cfg.tuning.leadTicks + this.maxPrediction + maxDelay
-    this.checkCap = Math.ceil(cfg.tuning.snapshotRing / this.maxPrediction)
+    this.inputCapacity = cfg.tuning.epochTicks * cfg.tuning.keyframeEvery + cfg.tuning.snapshotRing + cfg.tuning.leadTicks + this.maxPrediction + maxDelay
+    this.checkCap = Math.min(0xff, Math.ceil(cfg.tuning.snapshotRing / Math.max(1, this.maxPrediction)))
     for (let i = 0; i < this.checkCap; i++) this.checkPool.push({ domain: 0, tick: 0, hash: 0 })
     const minDelay = cfg.minDelay ?? DEFAULT_MIN_DELAY
     const hiddenTicks = cfg.delayHiddenTicks ?? DEFAULT_DELAY_HIDDEN_TICKS
@@ -423,6 +427,8 @@ export class ZoneSession<TInput> {
       end: Infinity,
       build,
       recovery: new DomainRecovery(spec.id, this.cfg.localPeer, this.tuning, this.checkCap),
+      keyframeAt: -1,
+      announcedTick: -1,
       desyncAt: Infinity,
       epTick: -1,
       trust: new Int32Array(MAX_PEERS),
@@ -652,6 +658,7 @@ export class ZoneSession<TInput> {
 
   /** A flagged reset: the state at its boundary becomes factory.reset(spec, t), the same on every replica. */
   private resetStep(d: DomainState<TInput>, t: number): void {
+    this.corrupt.delete(d)
     const w = this.buildW
     w.reset()
     this.cfg.factory.reset(d.spec, t).snapshot(w)
@@ -1263,10 +1270,10 @@ export class ZoneSession<TInput> {
     if (r.status === 'agreement') {
       // Every replica matches after the episode: their later disagreements count again.
       if (t > d.epTick) for (let i = 0; i < replicas.length; i++) if (d.trust[replicas[i]] > t + 1) d.trust[replicas[i]] = t + 1
-      if (d.ring.isKeyframeTick(t) && t > d.recovery.keyframeTick && d.ring.agreeKeyframe(t)) d.recovery.markKeyframe(t, replicas)
+      if ((t === d.start || d.ring.isKeyframeTick(t)) && t > d.recovery.keyframeTick && t > d.keyframeAt) d.keyframeAt = t
       return
     }
-    if (r.status !== 'disagreement' || !r.complete || d.sim.tick < d.waitUntil) return
+    if (r.status !== 'disagreement' || d.sim.tick < d.waitUntil) return
     for (let i = 0; i < r.differingCount; i++) {
       if (t >= d.trust[r.differing[i]]) {
         if (t < d.desyncAt) d.desyncAt = t
@@ -1278,37 +1285,55 @@ export class ZoneSession<TInput> {
   /** A peer's ZDESYNC carries its hash at the episode tick: recorded like a check, so this replica decides alike. */
   private onDesync(m: ZDesyncMsg): void {
     const d = this.stateFor(m.domain, m.tick)
-    if (!d) return
+    if (!d || !d.liveReplicas.includes(m.from)) return
     d.recovery.record(m.from, m.tick, m.hash)
+    // Matching the sender does not mean agreement: another replica may be the loser.
+    if (m.tick > d.epTick && m.tick >= d.trust[m.from] && d.sim.tick >= d.waitUntil) {
+      d.desyncAt = Math.min(d.desyncAt, m.tick)
+    }
     this.checkTick(d, m.tick)
   }
 
-  /** Applies the producer's corrections, then enters the episodes the checks found. */
+  /** Retains agreed keyframes, enters episodes, then applies any producer correction received ahead of the checks. */
   private recover(_now: number): void {
     const n = this.list.length
     for (let i = 0; i < n + this.grace.length; i++) {
       const d = i < n ? this.list[i] : this.grace[i - n]
-      if (d.fix !== null) this.applyFix(d)
+      if (d.keyframeAt >= 0) {
+        const t = d.keyframeAt
+        d.keyframeAt = -1
+        if (d.ring.agreeKeyframe(t)) d.recovery.markKeyframe(t, d.liveReplicas)
+      }
       if (d.desyncAt !== Infinity) {
         const t = d.desyncAt
         d.desyncAt = Infinity
         this.episode(d, t)
       }
+      if (d.fix !== null && d.desyncAt === Infinity) this.applyFix(d)
     }
   }
 
   /**
    * Enters the episode of a disagreement at t: ZDESYNC to the other replicas, then by cost class. reset: every replica
-   * flags the boundary. tiebreak: the producer sends its latest confirmed snapshot to the losers. checkpoint: the
-   * producer and the winners roll back to their last agreed keyframe and the producer sends it; when its inputs are
-   * no longer buffered, the producer falls back to the tiebreak snapshot. Losers wait for the producer's snapshot.
+   * flags the boundary. tiebreak: the producer sends its latest confirmed snapshot to the losers. checkpoint:
+   * every replica rolls back to its last agreed keyframe and the producer sends it to losers. Before the first
+   * agreement, the producer's confirmed snapshot bootstraps the checkpoint.
    */
   private episode(d: DomainState<TInput>, t: number): void {
     if (t <= d.epTick || d.sim.tick < d.waitUntil) return
     const replicas = d.liveReplicas
-    // A reset boundary derived from t alone, past every replica's present when it can still see t.
-    const dec = d.recovery.decide(d.spec.kind, t, replicas, t + this.inputCapacity)
-    if (!dec) return
+    const hash = d.ring.hashAt(t)
+    if (hash === undefined) return
+    if (d.announcedTick !== t) {
+      d.announcedTick = t
+      this.fanOut(d.peers, 'reliable', this.writer.desync(this.cfg.localPeer, d.spec.id, t, hash))
+    }
+    // All replicas use the episode tick's next boundary, replaying it if already passed.
+    const dec = d.recovery.decide(d.spec.kind, t, replicas, t)
+    if (!dec) {
+      if (!d.recovery.check(t, replicas).complete) d.desyncAt = t
+      return
+    }
     const r = d.recovery.check(t, replicas)
     const losers = this.desyncPeers
     losers.length = 0
@@ -1317,7 +1342,6 @@ export class ZoneSession<TInput> {
     this.stats.desyncs++
     if (this.onDomainDesync) this.onDomainDesync(d.spec.id, t, losers)
     const local = this.cfg.localPeer
-    this.fanOut(d.peers, 'reliable', this.writer.desync(local, d.spec.id, t, d.ring.hashAt(t) ?? 0))
     if (dec.action === 'reset') {
       this.flagReset(d, dec.tick)
       return
@@ -1325,14 +1349,12 @@ export class ZoneSession<TInput> {
     // Hashes recorded before the corrections are stale until the replicas agree again, or this expiry passes.
     const expiry = d.sim.tick + this.inputCapacity
     for (let i = 0; i < replicas.length; i++) if (replicas[i] !== local) d.trust[replicas[i]] = expiry
+    const kf = dec.action === 'checkpoint' ? d.ring.lastAgreedKeyframe() : null
+    if (kf) this.correct(d, kf.tick, kf.bytes, false)
     if (dec.localLoser) {
       d.waitUntil = expiry
       return
     }
-    let kf = dec.action === 'checkpoint' ? d.ring.lastAgreedKeyframe() : null
-    // The keyframe's inputs must still be buffered: inputCapacity minus the prediction and delay held ahead.
-    if (kf && this.tick - kf.tick >= this.tuning.snapshotRing + this.tuning.leadTicks) kf = null
-    if (kf) this.correct(d, kf.tick, kf.bytes)
     if (!dec.localAuthority) return
     let tick = kf ? kf.tick : d.confirmed
     while (!kf && tick >= t && !d.ring.has(tick)) tick--
@@ -1346,7 +1368,7 @@ export class ZoneSession<TInput> {
   private applyFix(d: DomainState<TInput>): void {
     const f = d.fix!
     d.fix = null
-    this.correct(d, f.tick, f.bytes)
+    this.correct(d, f.tick, f.bytes, this.tuning.costClass[d.spec.kind] === 'tiebreak')
     // A correction can arrive before this replica saw the episode: the others' older hashes are stale here too.
     const expiry = d.sim.tick + this.inputCapacity
     for (let i = 0; i < d.peers.length; i++) if (d.trust[d.peers[i]] < expiry) d.trust[d.peers[i]] = expiry
@@ -1359,13 +1381,13 @@ export class ZoneSession<TInput> {
    * Restores a state from snapshot bytes at `from` and re-simulates it to its present. Its hashes from `from` are
    * confirmed again, but only those past the old confirmed tick are checked: the older ones went out before.
    */
-  private correct(d: DomainState<TInput>, from: number, bytes: Uint8Array): void {
+  private correct(d: DomainState<TInput>, from: number, bytes: Uint8Array, smooth: boolean): void {
     const sim = d.sim
     const present = sim.tick
     const oc = d.confirmed
     // The correction is the fix of a debugCorrupt divergence too.
     this.corrupt.delete(d)
-    const view = sim.view
+    const view = smooth ? sim.view : undefined
     if (view && d.smoother) d.smoother.capture(view)
     if (sim.beginResim) sim.beginResim()
     try {
@@ -1391,7 +1413,7 @@ export class ZoneSession<TInput> {
 
   /**
    * Flags the state holding boundary B for factory.reset there. A replica already past B re-runs it by a rollback.
-   * Hashes before B are no longer compared: B lies past every replica's present at the episode.
+   * Hashes before B are no longer compared: the reset supersedes that divergent history.
    */
   private flagReset(d: DomainState<TInput>, B: number): void {
     const x = this.stateFor(d.spec.id, B) ?? d
