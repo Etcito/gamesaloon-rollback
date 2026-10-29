@@ -213,6 +213,36 @@ test("shadow proxies: create on first sight, follow the next pose, remove when a
   world.sim.free();
 });
 
+test("a fresh ShadowProxies on a restored world drops proxies absent from a count-zero payload", () => {
+  const original = makeWorld();
+  stepN(original, 30);
+  new ShadowProxies(R, original).step(shadowView(7, shadowPayload([[5, 1, 2, 3], [6, 4, 5, 6]])));
+  assert.notEqual(original.proxyBody(7, 5), undefined);
+  assert.notEqual(original.proxyBody(7, 6), undefined);
+
+  const sw = new SnapWriter();
+  original.snapshot(sw);
+  const restored = new RapierDomainWorld(R, buildEntity, buildJoint);
+  restored.restore(new SnapReader(sw.bytes().slice()));
+  assert.notEqual(restored.proxyBody(7, 5), undefined, "the envelope carries the proxy table");
+
+  new ShadowProxies(R, restored).step(shadowView(7, shadowPayload([])));
+  assert.equal(restored.proxyBody(7, 5), undefined, "no instance-local history: the table is reconciled");
+  assert.equal(restored.proxyBody(7, 6), undefined);
+
+  new ShadowProxies(R, original).step(shadowView(7, shadowPayload([])));
+  original.step();
+  restored.step();
+  assert.equal(restored.hash(), original.hash());
+  const a = new SnapWriter();
+  const b = new SnapWriter();
+  original.snapshot(a);
+  restored.snapshot(b);
+  assert.deepStrictEqual(b.bytes().slice(), a.bytes().slice());
+  original.sim.free();
+  restored.sim.free();
+});
+
 test("kinematic-by-tick parts follow the tick and stay out of the entity table", () => {
   const world = new RapierDomainWorld(R, buildEntity, buildJoint);
   const body = world.sim.createBody(R.RigidBodyDesc.kinematicPositionBased());
