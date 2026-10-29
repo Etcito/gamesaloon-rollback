@@ -5,28 +5,27 @@ import { InputBuffer } from '../inputBuffer.ts'
 import { MAX_FRAME_DT } from '../rollback.ts'
 import { SnapReader, SnapWriter } from '../snap.ts'
 import { CorrectionSmoother } from '../smoothing.ts'
-import { DEFAULT_DELAY_HIDDEN_TICKS, DEFAULT_MAX_DELAY, DEFAULT_MAX_PREDICTION, DEFAULT_MIN_DELAY, DEFAULT_TICK_RATE, DelayController, MAX_PEERS } from '../timing.ts'
+import { DEFAULT_LOST_AFTER_MS, DEFAULT_DROP_WAIT_MS, DEFAULT_DELAY_HIDDEN_TICKS, DEFAULT_MAX_DELAY, DEFAULT_MAX_PREDICTION, DEFAULT_MIN_DELAY, DEFAULT_TICK_RATE, DelayController, MAX_PEERS } from '../timing.ts'
 import type { InputCodec, NetChannel, RollbackTuning } from '../types.ts'
-import { MAX_WIRE_PLAYERS, MAX_WIRE_TICKS, SnapshotAssembler } from '../wire.ts'
+import { MAX_WIRE_PLAYERS, MAX_WIRE_TICKS, MSG, SnapshotAssembler, WireWriter } from '../wire.ts'
 import type { SnapshotMsg } from '../wire.ts'
 import { assign } from './assign.ts'
+import { CONTROL_NO_CELL, packControl, unpackControl } from './control.ts'
 import { DomainRing } from './domainRing.ts'
 import { ControlStore, planEpoch } from './epoch.ts'
 import type { DomainTransfer } from './epoch.ts'
+import { FarReader, FarSchedule } from './far.ts'
+import type { FarSink } from './far.ts'
 import { DomainFrontier } from './frontier.ts'
-import { DomainRecovery } from './recovery.ts'
+import { DomainRecovery, DropAgreement, SleepWakeDedupe } from './recovery.ts'
 import type { HashCheck } from './recovery.ts'
 import { validateZoneTuning } from './tuning.ts'
 import type { ZoneTuning } from './tuning.ts'
-import type { Assignment, DomainFactory, DomainId, DomainSim, DomainSpec, GroupTransport, Roster, SeatId } from './types.ts'
+import type { Assignment, DomainFactory, DomainId, DomainSim, DomainSpec, GroupTransport, Roster, SeatId, SleepEvent } from './types.ts'
 import { decodeZone, ZMSG, ZoneWireWriter } from './wire.ts'
 import type { ZControlMsg, ZDesyncMsg, ZDomainSnapshotMsg, ZInputMsg, ZShadowMsg } from './wire.ts'
 
-/** Receives the display-only far stream: poses of entities in domains the local peer does not replicate. */
-export interface FarSink {
-  /** `entries` is a view valid during the call; the producing domain's far() defines its layout. */
-  far(domain: DomainId, tick: number, stride: number, n: number, entries: Uint8Array): void
-}
+export type { FarSink } from './far.ts'
 
 export interface ZoneSessionConfig<TInput>
   extends Pick<RollbackTuning, 'tickRate' | 'maxPrediction' | 'minDelay' | 'maxDelay' | 'delayHiddenTicks' | 'lostAfterMs' | 'dropWaitMs'> {
@@ -41,6 +40,12 @@ export interface ZoneSessionConfig<TInput>
   /** Most ticks run per frame, by the session and by each lagging domain. Default: the ticks of one MAX_FRAME_DT. */
   maxSubsteps?: number
   initialDelay?: number
+  /** Start without driving seats; snapshots restore a late rejoin before its next boundary. */
+  observer?: boolean
+  botInput?: (seat: SeatId, tick: number, out: TInput) => void
+  onSleep?: (domain: DomainId, id: number, tick: number, asleep: boolean) => void
+  farSink?: FarSink
+  /** @deprecated Use farSink. */
   far?: FarSink
 }
 
@@ -59,6 +64,7 @@ export interface ZoneStats {
   desyncs: number
   malformed: number
   lostPeers: number[]
+  sleepTransitions: number
 }
 
 /** One domain replicated by the local peer. */
@@ -111,6 +117,10 @@ export interface DomainState<TInput> {
   floor: number
   /** Boundary at which factory.reset replaces the state, replayed by a rollback across it; -1 when none. */
   resetAt: number
+  readonly liveReplicas: number[]
+  readonly hosts: Int16Array
+  readonly drops: Map<number, { agreement: DropAgreement; seen: Uint8Array; since: number; from: number }>
+  readonly sleepLog: ShadowOutRing
 }
 
 /** The derivation of a state created at S, run again when a source re-simulates across S. */
@@ -140,7 +150,23 @@ export class ZoneSession<TInput> {
   readonly stats: ZoneStats
   /** Called when the local replica enters a desync episode of a domain; `peers` (the replicas whose hash differs) is valid during the call. */
   onDomainDesync: ((domain: DomainId, tick: number, peers: readonly number[]) => void) | null = null
-  private readonly net: GroupTransport
+  onPeerLost: ((peer: number, tick: number) => void) | null = null
+  private stopped = false
+  private awaitingSnapshot = false
+  private readonly lastNews = new Float64Array(MAX_PEERS)
+  private readonly lost = new Uint8Array(MAX_PEERS)
+  private readonly rejoinAt = new Float64Array(MAX_PEERS).fill(Infinity)
+  private readonly roster: Roster
+  private readonly bot: TInput
+  private farSchedule: FarSchedule
+  private prevFarSchedule: FarSchedule
+  private readonly farLog: ShadowOutRing
+  private readonly sleepEvents: SleepEvent[] = []
+  private readonly eventReader = new FarReader()
+  private readonly lastControl: Uint32Array
+  private readonly controlFields = { cell: 0, cpuClass: 0, bwClass: 0, latClass: 0, spareSlots: 0 }
+  private readonly sleepTables = new Map<DomainId, SleepWakeDedupe>()
+  private net: GroupTransport | null
   private readonly cfg: ZoneSessionConfig<TInput>
   private readonly codec: InputCodec<TInput>
   private readonly tuning: ZoneTuning
@@ -179,8 +205,9 @@ export class ZoneSession<TInput> {
   private readonly buildW = new SnapWriter()
   private readonly delayCtl: DelayController
   private readonly writer = new ZoneWireWriter()
+  private readonly farReader = new FarReader()
   private readonly inbox: { peer: number; ch: NetChannel; data: Uint8Array }[] = []
-  /** Roster peer of each seat: only it may send the seat's CONTROL and ZINPUT words. */
+  /** Roster owner of each seat's CONTROL words; ZINPUT may also come from its elected bot host. */
   private readonly seatOwner: Int16Array
   private readonly isPeer = new Uint8Array(MAX_PEERS)
   /** Every other roster peer, ascending: CONTROL goes to all of them. */
@@ -209,9 +236,11 @@ export class ZoneSession<TInput> {
   private readonly corrupt = new Map<DomainState<TInput>, { tick: number; fn: (sim: DomainSim<TInput>) => void }>()
 
   constructor(cfg: ZoneSessionConfig<TInput>, net: GroupTransport) {
+    this.awaitingSnapshot = cfg.observer ?? false
     this.cfg = cfg
     this.net = net
     this.codec = cfg.codec
+    this.lastControl = cfg.controls.slice()
     this.tuning = cfg.tuning
     const tickRate = cfg.tickRate ?? DEFAULT_TICK_RATE
     if (!(tickRate > 0 && tickRate < Infinity)) throw new Error('[zones] session: bad tickRate')
@@ -222,7 +251,10 @@ export class ZoneSession<TInput> {
     const maxDelay = cfg.maxDelay ?? DEFAULT_MAX_DELAY
     validateZoneTuning(cfg.tuning, { maxPrediction: this.maxPrediction, maxDelay })
     if (!(cfg.tuning.snapshotRing > this.maxPrediction)) throw new Error('[zones] session: snapshotRing must exceed maxPrediction')
-    const roster = cfg.roster
+    const roster = this.roster = { ...cfg.roster, live: cfg.roster.live.slice() }
+    this.lastNews.fill(net.now())
+    this.bot = cfg.codec.create()
+    if (cfg.observer) this.rejoinAt[cfg.localPeer] = cfg.tuning.epochTicks
     const local = roster.peers.find((p) => p.peer === cfg.localPeer)
     if (!(cfg.localPeer >= 0 && cfg.localPeer < MAX_PEERS && local)) throw new Error(`[zones] session: local peer ${cfg.localPeer} is not in the roster`)
     if (cfg.controls.length !== roster.seatCount) throw new Error('[zones] session: controls must hold one word per seat')
@@ -255,11 +287,15 @@ export class ZoneSession<TInput> {
     this.limit = cfg.tuning.epochTicks
     this.stats = {
       tick: 0, confirmedTick: {}, delay: this.delayCtl.current, frames: 0, rollbacks: 0, maxRollback: 0, resimTicks: 0,
-      stallFrames: 0, desyncs: 0, malformed: 0, lostPeers: [],
+      stallFrames: 0, desyncs: 0, malformed: 0, lostPeers: [], sleepTransitions: 0,
     }
 
     // Epoch 0: every domain the local peer replicates, created in ascending id order.
     this.current = assign(roster, { epoch: 0, words: cfg.controls.slice() }, null, cfg.tuning)
+    this.farSchedule = new FarSchedule(cfg.tuning, MAX_PEERS, this.current.domains.length)
+    this.farSchedule.rebuild(this.current, roster, { epoch: 0, words: cfg.controls })
+    this.prevFarSchedule = new FarSchedule(cfg.tuning, MAX_PEERS, this.current.domains.length)
+    this.farLog = new ShadowOutRing(0, false, [], 1, -1)
     for (const spec of this.current.domains) {
       if (spec.replicas.indexOf(cfg.localPeer) >= 0) this.addDomain(spec, cfg.factory.create(spec, 0))
     }
@@ -269,7 +305,7 @@ export class ZoneSession<TInput> {
     for (let t = 0; t < this.delayCtl.current; t++) {
       for (let i = 0; i < n; i++) {
         const seat = this.localSeats[i]
-        this.controls.set(seat, t, cfg.controls[seat])
+        this.controls.set(seat, t, cfg.observer ? this.observerWord(cfg.controls[seat]) : cfg.controls[seat])
         this.localBufs[i].set(t, cfg.codec.neutral)
         this.storeLocalSeat(seat, t, cfg.codec.neutral >>> 0)
       }
@@ -312,11 +348,14 @@ export class ZoneSession<TInput> {
    * (unless a local seat's domain stalls), step every domain toward the session tick, confirm and send. Returns alpha.
    */
   frame(frameDt: number, sample: (inputs: TInput[], controls: Uint32Array) => void): number {
+    if (this.stopped) return 0
     const stats = this.stats
     stats.frames++
     const dt = frameDt > 0 ? (frameDt < MAX_FRAME_DT ? frameDt : MAX_FRAME_DT) : 0
-    const now = this.net.now()
+    const now = this.net!.now()
     this.receive(now)
+    this.disconnect(now)
+    this.driveBots(now)
     this.recover(now)
     // Old states first: one that re-simulates marks what was derived from it at S.
     for (let i = 0; i < this.grace.length; i++) this.rollback(this.grace[i])
@@ -368,7 +407,7 @@ export class ZoneSession<TInput> {
       inputs: new DomainFrontier(frontierCfg, spec, inbound),
       ring,
       rollbackTick: Infinity,
-      producer: spec.replicas[0] === this.cfg.localPeer,
+      producer: !this.observing(this.cfg.localPeer, sim.tick) && spec.replicas[0] === this.cfg.localPeer,
       replica: true,
       graceUntil: -1,
       confirmed: sim.tick - 1,
@@ -391,6 +430,9 @@ export class ZoneSession<TInput> {
       fixAsm: new SnapshotAssembler(),
       floor: sim.tick,
       resetAt: -1,
+      liveReplicas: spec.replicas.slice(),
+      hosts: this.current.seatHost.slice(), drops: new Map(),
+      sleepLog: new ShadowOutRing(spec.id, false, [], ring.size, sim.tick - 1),
     }
     let at = this.list.length
     while (at > 0 && this.list[at - 1].spec.id > spec.id) at--
@@ -417,6 +459,7 @@ export class ZoneSession<TInput> {
 
   /** True when a domain holding a local seat cannot step the session tick: the local seats wait. */
   private localStalled(): boolean {
+    if (this.observing(this.cfg.localPeer, this.tick)) return false
     const doms = this.localDomain
     for (let i = 0; i < doms.length; i++) {
       const d = doms[i]
@@ -442,7 +485,10 @@ export class ZoneSession<TInput> {
 
   /** Steps one state toward the session tick, releases its build once nothing it read can change, and confirms. */
   private advance(d: DomainState<TInput>): void {
-    for (let k = 0; k < this.maxSubsteps && d.sim.tick < this.tick && this.canStep(d, d.sim.tick); k++) this.simulate(d, d.sim.tick)
+    for (let k = 0; k < this.maxSubsteps && d.sim.tick < this.tick && this.canStep(d, d.sim.tick); k++) {
+      this.simulate(d, d.sim.tick)
+      this.farOut(d, d.sim.tick)
+    }
     const b = d.build
     if (b !== null && !b.dirty && d.sim.tick > d.start && b.got.size >= b.transfers.length) {
       let done = true
@@ -464,6 +510,11 @@ export class ZoneSession<TInput> {
   private simulate(d: DomainState<TInput>, t: number): void {
     if (t === d.start && d.build !== null && d.build.dirty) this.epochStep(d, t)
     if (t === d.resetAt) this.resetStep(d, t)
+    if (t % this.tuning.epochTicks === 0) d.producer = this.producerOf(d) === this.cfg.localPeer
+    for (const seat of d.spec.seats) {
+      const host = this.hostAt(d, seat, t)
+      d.sim.seatHost(seat, host, host !== this.seatOwner[seat])
+    }
     const size = d.ring.size
     const slot = t % size
     d.ring.save(d.sim, t)
@@ -488,7 +539,6 @@ export class ZoneSession<TInput> {
       if (c && c.tick === t) c.fn(d.sim)
     }
     this.afterStep(d, t)
-    this.farOut(d, t)
   }
 
   /** Reloads the earliest changed tick of one domain and re-simulates it to its present, view events muted. */
@@ -532,6 +582,13 @@ export class ZoneSession<TInput> {
       d.ring.recordHash(t, h)
       d.recovery.record(this.cfg.localPeer, t, h)
       this.checkTick(d, t)
+    }
+    const log = d.sleepLog
+    const last = Math.min(d.inputs.frontier(), d.sim.tick - 1, c, d.rollbackTick - 1)
+    for (let tick = log.sent + 1; tick <= last; tick++) {
+      const r = this.eventReader.bind(log.payload(tick))
+      while (r.remaining) this.recordSleep(d.spec.id, r.u32(), r.i32(), r.bool(), d.producer)
+      log.sent = tick
     }
     if (c > d.confirmed) {
       d.confirmed = c
@@ -609,7 +666,8 @@ export class ZoneSession<TInput> {
     if (next < tick) next = tick
     for (let t = next; t <= tick + delay; t++) {
       for (let i = 0; i < seats.length; i++) {
-        this.controls.set(seats[i], t, this.localControls[i])
+        if (!this.observing(this.cfg.localPeer, t)) this.lastControl[seats[i]] = this.localControls[i]
+        this.controls.set(seats[i], t, this.observing(this.cfg.localPeer, t) ? this.observerWord(this.localControls[i]) : this.localControls[i])
         this.localBufs[i].set(t, this.localCodes[i])
         this.storeLocalSeat(seats[i], t, this.localCodes[i])
       }
@@ -618,8 +676,8 @@ export class ZoneSession<TInput> {
 
   /** A local code goes to every state listing the seat that holds tick t: its seat domain and the global domain. */
   private storeLocalSeat(seat: SeatId, t: number, code: number): void {
-    for (let i = 0; i < this.list.length; i++) if (t >= this.list[i].start) this.storeSeat(this.list[i], seat, t, code)
-    for (let i = 0; i < this.grace.length; i++) if (t < this.grace[i].end) this.storeSeat(this.grace[i], seat, t, code)
+    for (let i = 0; i < this.list.length; i++) if (t >= this.list[i].start && this.hostAt(this.list[i], seat, t) === this.cfg.localPeer && !this.observing(this.cfg.localPeer, t)) this.storeSeat(this.list[i], seat, t, code)
+    for (let i = 0; i < this.grace.length; i++) if (t < this.grace[i].end && this.hostAt(this.grace[i], seat, t) === this.cfg.localPeer && !this.observing(this.cfg.localPeer, t)) this.storeSeat(this.grace[i], seat, t, code)
   }
 
   /**
@@ -647,25 +705,65 @@ export class ZoneSession<TInput> {
 
   /** Drains the transport and routes each message to what it names; messages for unreplicated domains are dropped. */
   private receive(_now: number): void {
-    this.net.drain(this.inbox)
+    this.net!.drain(this.inbox)
     this.dispatch(this.inbox)
+    if (!this.awaitingSnapshot && this.early.length && this.observing(this.cfg.localPeer, this.tick)) {
+      const early = this.early
+      this.early = []
+      this.dispatch(early)
+    }
   }
 
   private dispatch(inbox: { peer: number; ch: NetChannel; data: Uint8Array }[]): void {
     for (let i = 0; i < inbox.length; i++) {
       const e = inbox[i]
+      if (e.data.length === 2 && e.data[0] === MSG.BYE && e.data[1] === e.peer && this.isPeer[e.peer]) {
+        this.peerLost(e.peer, this.net!.now())
+        continue
+      }
       const m = decodeZone(e.data)
       const from = e.peer
       if (!m || m.from !== from || from === this.cfg.localPeer || this.isPeer[from] !== 1) {
         this.stats.malformed++
         continue
       }
+      this.news(from)
       // SHADOW, DOMAIN_SNAPSHOT and ZDESYNC arrive once: one reaching past a boundary not planned here yet waits for the plan.
-      if ((m.type === ZMSG.SHADOW && m.firstTick + m.count > this.limit) || ((m.type === ZMSG.DOMAIN_SNAPSHOT || m.type === ZMSG.ZDESYNC) && m.tick >= this.limit)) {
+      if (!(m.type === ZMSG.DOMAIN_SNAPSHOT && this.observing(this.cfg.localPeer, this.tick)) && ((m.type === ZMSG.SHADOW && m.firstTick + m.count > this.limit) || ((m.type === ZMSG.DOMAIN_SNAPSHOT || m.type === ZMSG.ZDESYNC) && m.tick >= this.limit))) {
         this.early.push({ peer: from, ch: e.ch, data: e.data.slice() })
         continue
       }
       switch (m.type) {
+        case ZMSG.ZDROP: {
+          const d = this.byId.get(m.domain)
+          if (d && d.spec.replicas.includes(from) && this.isPeer[m.lostPeer] && (d.drops.get(m.lostPeer)?.from === Infinity || this.rejoinAt[m.lostPeer] === Infinity || m.lastTick >= this.rejoinAt[m.lostPeer])) {
+            this.peerLost(m.lostPeer, this.net!.now())
+            const drop = d.drops.get(m.lostPeer)
+            if (drop) {
+              drop.agreement.report(from, m.lastTick)
+              drop.seen[from] = 1
+              if (m.lostPeer === this.cfg.localPeer) drop.from = drop.agreement.fromTick ?? Infinity
+            }
+          }
+          break
+        }
+        case ZMSG.SLEEP:
+        case ZMSG.WAKE: {
+          const d = this.stateFor(m.domain, m.tick)
+          if (!d || from === this.producerOf(d)) this.recordSleep(m.domain, m.id, m.tick, m.type === ZMSG.SLEEP, false)
+          break
+        }
+        case ZMSG.FAR: {
+          const sink = this.cfg.farSink ?? this.cfg.far
+          if (sink) {
+            try {
+              sink.far(m.domain, m.tick, m.stride, m.n, this.farReader.bind(m.entries))
+            } catch {
+              this.stats.malformed++
+            }
+          }
+          break
+        }
         case ZMSG.CONTROL:
           this.onControl(m)
           break
@@ -700,7 +798,11 @@ export class ZoneSession<TInput> {
       return
     }
     for (let t = 0; t < m.count; t++) {
-      for (let j = 0; j < n; j++) this.controls.set(m.seatIds[j], m.firstTick + t, m.words[t * n + j])
+      for (let j = 0; j < n; j++) {
+        const word = m.words[t * n + j], observer = this.observing(m.from, m.firstTick + t)
+        if (!observer) this.lastControl[m.seatIds[j]] = word
+        this.controls.set(m.seatIds[j], m.firstTick + t, observer ? this.observerWord(word) : word)
+      }
     }
   }
 
@@ -717,7 +819,7 @@ export class ZoneSession<TInput> {
 
   private onInput(m: ZInputMsg): void {
     const n = m.seats
-    if (m.firstTick < 0 || !this.owns(m.from, m.seatIds, n)) {
+    if (m.firstTick < 0) {
       this.stats.malformed++
       return
     }
@@ -735,7 +837,12 @@ export class ZoneSession<TInput> {
     if (m.ackTick > d.peerAck[m.from]) d.peerAck[m.from] = m.ackTick
     // storeSeat schedules the domain's rollback from the earliest tick that ran with another code.
     for (let t = 0; t < m.count; t++) {
-      for (let j = 0; j < n; j++) this.storeSeat(d, m.seatIds[j], m.firstTick + t, m.codes[t * n + j])
+      for (let j = 0; j < n; j++) {
+        const seat = m.seatIds[j], tick = m.firstTick + t
+        const drop = d.drops.get(this.seatOwner[seat])
+        const relay = d.peers.includes(m.from) && ((drop && tick < drop.from) || this.observing(this.seatOwner[seat], tick))
+        if ((this.hostAt(d, seat, tick) === m.from || relay) && !this.observing(m.from, tick)) this.storeSeat(d, seat, tick, m.codes[t * n + j])
+      }
     }
   }
 
@@ -758,9 +865,24 @@ export class ZoneSession<TInput> {
     const n = this.stateFor(m.domain, m.tick)
     if (!n) return
     if (n.build === null || n.start !== m.tick) {
-      if (m.from !== n.spec.replicas[0] || n.producer) return
+      if (m.from !== this.producerOf(n) || n.producer) return
       const done = n.fixAsm.push(m as unknown as SnapshotMsg)
-      if (done) n.fix = done
+      if (done) {
+        n.fix = done
+        if (this.observing(this.cfg.localPeer, this.tick)) {
+          this.tick = Math.max(this.tick, done.tick)
+          this.nextEpoch = Math.floor(this.tick / this.tuning.epochTicks) + 1
+          this.limit = this.nextEpoch * this.tuning.epochTicks
+          if (this.awaitingSnapshot) this.rejoinAt[this.cfg.localPeer] = this.limit
+          this.awaitingSnapshot = false
+          this.roster.live[this.cfg.localPeer] = true
+          this.lost[this.cfg.localPeer] = 0
+          for (const buf of n.inputs.buffers) buf.lastTick = Math.max(buf.lastTick, done.tick - 1)
+          for (const sh of n.inputs.shadows) sh.lastTick = Math.max(sh.lastTick, done.tick - 1)
+          for (const buf of this.localBufs) buf.lastTick = Math.max(buf.lastTick, done.tick - 1)
+          this.controlSent = Math.max(this.controlSent, done.tick - 1)
+        }
+      }
       return
     }
     const b = n.build
@@ -791,7 +913,7 @@ export class ZoneSession<TInput> {
       const d = i < n ? this.list[i] : this.grace[i - n]
       this.sendInputs(d)
       const links = this.shadowOut.get(d)
-      if (links) for (let k = 0; k < links.length; k++) this.sendShadow(d, links[k])
+      if (d.producer && links) for (let k = 0; k < links.length; k++) this.sendShadow(d, links[k])
     }
     this.sendOwed()
   }
@@ -823,7 +945,7 @@ export class ZoneSession<TInput> {
 
   /** One send per message: sendMany when the transport has it, else a send per peer. */
   private fanOut(peers: readonly number[], ch: NetChannel, data: Uint8Array): void {
-    const net = this.net
+    const net = this.net!
     if (net.sendMany) {
       if (peers.length > 0) net.sendMany(peers, ch, data)
       return
@@ -860,30 +982,31 @@ export class ZoneSession<TInput> {
    * among them, and ackTick is the lowest contiguous tick held of the other seats, a safe ack for each sender. A
    * replica with no local seat in the domain still sends it, with no seats, for its ack and its confirmed hash checks.
    */
-  private sendInputs(d: DomainState<TInput>): void {
+  private sendInputs(d: DomainState<TInput>, offset = 0): void {
     const peers = d.peers
     if (peers.length === 0) return
     const m = this.zinOut
     const seats = d.inputs.seats
     const bufs = d.inputs.buffers
     const local = this.cfg.localPeer
-    let nk = 0
+    let nk = 0, owned = 0
     let ack = Infinity
     for (let i = 0; i < seats.length; i++) {
-      if (this.seatOwner[seats[i]] !== local) {
+      if (this.hostAt(d, seats[i], Math.max(d.start, bufs[i].lastTick)) !== local || this.observing(local, Math.max(d.start, bufs[i].lastTick))) {
         if (bufs[i].lastTick < ack) ack = bufs[i].lastTick
-      } else if (nk < MAX_WIRE_PLAYERS) {
+      } else if (owned++ >= offset && nk < MAX_WIRE_PLAYERS) {
         m.seatIds[nk] = seats[i]
         this.zinIdx[nk++] = i
       }
     }
     let localLast = nk > 0 ? bufs[this.zinIdx[0]].lastTick : d.sim.tick
+    for (let j = 1; j < nk; j++) localLast = Math.min(localLast, bufs[this.zinIdx[j]].lastTick)
     // A state answers for its own ticks only, never past an unplanned boundary, so receivers route by firstTick.
     const end = d.end < this.limit ? d.end : this.limit
     if (localLast > end - 1) localLast = end - 1
     if (localLast < d.start) return
     let first = Infinity
-    for (let i = 0; i < peers.length; i++) if (d.peerAck[peers[i]] + 1 < first) first = d.peerAck[peers[i]] + 1
+    for (let i = 0; i < peers.length; i++) if (this.roster.live[peers[i]] && d.peerAck[peers[i]] + 1 < first) first = d.peerAck[peers[i]] + 1
     if (first > localLast) first = localLast
     if (first <= localLast - this.inputCapacity) first = localLast - MAX_WIRE_TICKS + 1
     if (first < d.start) first = d.start
@@ -903,10 +1026,11 @@ export class ZoneSession<TInput> {
     m.seats = nk
     m.senderTick = this.tick
     // One message goes to every replica, so the rotation of the first one serves them all.
-    const nc = d.recovery.pickChecks(peers[0], d.spec.replicas, this.checkPool)
+    const nc = d.recovery.pickChecks(d.liveReplicas[0] === local ? d.liveReplicas[1] : d.liveReplicas[0], d.liveReplicas, this.checkPool)
     m.checks.length = nc
     for (let i = 0; i < nc; i++) m.checks[i] = this.checkPool[i]
     this.fanOut(peers, 'fast', this.writer.zinput(m))
+    if (owned > offset + nk) this.sendInputs(d, offset + nk)
   }
 
   /**
@@ -940,7 +1064,6 @@ export class ZoneSession<TInput> {
    */
   private bindShadowOut(d: DomainState<TInput>): void {
     this.shadowOut.delete(d)
-    if (!d.producer) return
     const local = this.cfg.localPeer
     const domains = this.current.domains
     const links: ShadowOutRing[] = []
@@ -973,6 +1096,16 @@ export class ZoneSession<TInput> {
 
   private afterStep(d: DomainState<TInput>, t: number): void {
     this.captureShadows(d, t + 1)
+    const out = this.sleepEvents, w = this.shadowW
+    out.length = 0
+    d.sim.sleepEvents(out)
+    w.reset()
+    for (let i = 0; i < out.length; i++) {
+      w.u32(out[i].id)
+      w.i32(out[i].tick)
+      w.bool(out[i].asleep)
+    }
+    d.sleepLog.store(t, w)
   }
 
   // ---- Epoch boundary S = E*K. Once the control sample of S-L is confirmed, assign() and planEpoch decide the
@@ -981,14 +1114,28 @@ export class ZoneSession<TInput> {
 
   /** Plans the next boundary when its control sample is confirmed; until then no state steps it. */
   private plan(): void {
+    if (this.awaitingSnapshot) return
     const E = this.nextEpoch
+    for (let seat = 0; seat < this.seatOwner.length; seat++) {
+      const p = this.seatOwner[seat]
+      this.controls.expect(seat, this.roster.live[p] && !this.observing(p, E * this.tuning.epochTicks - this.tuning.leadTicks))
+    }
     if (!this.controls.ready(E)) return
     const prev = this.current
-    const next = assign(this.cfg.roster, this.controls.sample(E), prev, this.tuning)
+    const sample = this.controls.sample(E)
+    for (let seat = 0; seat < sample.words.length; seat++) {
+      if (this.rejoinAt[this.seatOwner[seat]] === this.limit) sample.words[seat] = this.lastControl[seat]
+    }
+    const next = assign(this.roster, sample, prev, this.tuning)
+    const far = this.prevFarSchedule
+    this.prevFarSchedule = this.farSchedule
+    this.farSchedule = far
+    far.rebuild(next, this.roster, sample)
     const local = this.cfg.localPeer
     const plan = planEpoch(prev, next, local, this.tuning)
     const S = plan.tick
     const cont = continuedSet(prev, next)
+    for (const d of this.list) for (const peer of d.drops.keys()) if (this.rejoinAt[peer] <= S) cont.delete(d.spec.id)
     const old = new Map(this.byId)
     let k = 0
     for (const d of this.list) {
@@ -1101,7 +1248,7 @@ export class ZoneSession<TInput> {
 
   /** Evaluates tick t of one domain after a hash of it was recorded. Allocation-free. */
   private checkTick(d: DomainState<TInput>, t: number): void {
-    const replicas = d.spec.replicas
+    const replicas = d.liveReplicas
     const r = d.recovery.check(t, replicas)
     if (r.status === 'agreement') {
       // Every replica matches after the episode: their later disagreements count again.
@@ -1148,7 +1295,7 @@ export class ZoneSession<TInput> {
    */
   private episode(d: DomainState<TInput>, t: number): void {
     if (t <= d.epTick || d.sim.tick < d.waitUntil) return
-    const replicas = d.spec.replicas
+    const replicas = d.liveReplicas
     // A reset boundary derived from t alone, past every replica's present when it can still see t.
     const dec = d.recovery.decide(d.spec.kind, t, replicas, t + this.inputCapacity)
     if (!dec) return
@@ -1245,12 +1392,206 @@ export class ZoneSession<TInput> {
     if (x.confirmed >= B) x.confirmed = B - 1
   }
 
-  // ---- Hooks the next session tasks fill. Networking: the delay from the replicas' RTT. Recovery: lost peers and
-  // ZDROP agreement. Far: FAR from the producer.
-  private updateDelay(_now: number): number {
-    return this.delayCtl.current
+  /** BYE shares the core lifecycle framing; a left session sends nothing further. */
+  leave(): void {
+    if (this.stopped) return
+    this.fanOut(this.others, 'reliable', new WireWriter().bye(this.cfg.localPeer))
+    this.dispose()
   }
-  private farOut(_d: DomainState<TInput>, _t: number): void {}
+
+  /** Idempotent; frame() returns zero after releasing domain state. */
+  dispose(): void {
+    if (this.stopped) return
+    this.stopped = true
+    this.list.length = this.grace.length = this.owed.length = this.early.length = this.inbox.length = 0
+    this.localDomain.length = this.localBufs.length = this.localIn.length = 0
+    this.net = null
+    this.sleepTables.clear()
+    this.byId.clear()
+    this.shadowOut.clear()
+    this.corrupt.clear()
+    this.onPeerLost = this.onDomainDesync = null
+  }
+
+  private observing(peer: number, tick: number): boolean {
+    return (peer === this.cfg.localPeer && this.awaitingSnapshot) || (this.rejoinAt[peer] !== Infinity && tick < this.rejoinAt[peer])
+  }
+
+  private observerWord(word: number): number {
+    unpackControl(word, this.controlFields).cell = CONTROL_NO_CELL
+    return packControl(this.controlFields)
+  }
+
+  private producerOf(d: DomainState<TInput>): number {
+    for (const p of d.spec.replicas) if (this.roster.live[p] && !this.observing(p, d.sim.tick)) return p
+    return -1
+  }
+
+  private hostAt(d: DomainState<TInput>, seat: number, tick: number): number {
+    const drop = d.drops.get(this.seatOwner[seat])
+    return drop && tick >= drop.from ? drop.agreement.botHost(seat, Math.floor(drop.from / this.tuning.epochTicks)) : d.hosts[seat]
+  }
+
+  private peerLost(peer: number, now: number): void {
+    if (this.lost[peer]) return
+    this.lost[peer] = 1
+    this.roster.live[peer] = false
+    if (peer === this.cfg.localPeer) {
+      this.rejoinAt[peer] = this.limit
+      this.awaitingSnapshot = true
+    }
+    for (let s = 0; s < this.seatOwner.length; s++) if (this.seatOwner[s] === peer) this.controls.expect(s, false)
+    const n = this.list.length
+    for (let i = 0; i < n + this.grace.length; i++) {
+      const d = i < n ? this.list[i] : this.grace[i - n]
+      const live = d.liveReplicas
+      const at = live.indexOf(peer)
+      if (at >= 0) live.splice(at, 1)
+      for (const drop of d.drops.values()) {
+        drop.agreement.setLiveReplicas(live)
+        drop.since = now
+      }
+      let last = -1, affected = false
+      for (let j = 0; j < d.inputs.seats.length; j++) if (this.seatOwner[d.inputs.seats[j]] === peer) {
+        affected = true
+        last = Math.max(last, d.inputs.buffers[j].lastTick)
+      }
+      if (affected) {
+        const agreement = new DropAgreement(d.spec.id, peer, live)
+        const seen = new Uint8Array(MAX_PEERS)
+        seen[this.cfg.localPeer] = 1
+        agreement.report(this.cfg.localPeer, last)
+        d.drops.set(peer, { agreement, seen, since: now, from: Infinity })
+        this.fanOut(d.peers, 'reliable', this.writer.drop(this.cfg.localPeer, d.spec.id, peer, last))
+        this.dropTail(d, peer)
+      }
+      const producer = this.producerOf(d) === this.cfg.localPeer
+      if (producer && !d.producer) {
+        for (const link of this.shadowOut.get(d) ?? []) link.sent = Math.max(d.start - 1, d.sim.tick - this.inputCapacity)
+      }
+      d.producer = producer
+    }
+  }
+
+  /** Reliable ZINPUT tails fill holes below S before the elected bot starts at S+1. */
+  private dropTail(d: DomainState<TInput>, peer: number): void {
+    const m = this.zinOut
+    Object.assign(m, { from: this.cfg.localPeer, domain: d.spec.id, ackTick: -1, seats: 1, senderTick: this.tick })
+    m.checks.length = 0
+    for (let i = 0; i < d.inputs.seats.length; i++) {
+      if (this.seatOwner[d.inputs.seats[i]] !== peer) continue
+      const buf = d.inputs.buffers[i]
+      m.firstTick = Math.max(d.start, buf.lastTick - MAX_WIRE_TICKS + 1)
+      m.count = buf.lastTick - m.firstTick + 1
+      if (m.count <= 0) continue
+      m.seatIds[0] = d.inputs.seats[i]
+      for (let j = 0; j < m.count; j++) m.codes[j] = buf.get(m.firstTick + j) ?? this.codec.neutral
+      this.fanOut(d.peers, 'reliable', this.writer.zinput(m))
+    }
+  }
+
+  private disconnect(now: number): void {
+    for (const p of this.others) if (!this.lost[p] && (this.net!.closed(p) || now - this.lastNews[p] > (this.cfg.lostAfterMs ?? DEFAULT_LOST_AFTER_MS))) this.peerLost(p, now)
+    for (const p of this.others) {
+      if (this.lost[p] !== 1) continue
+      let all = true, last = -1
+      const n = this.list.length
+      for (let i = 0; i < n + this.grace.length; i++) {
+        const d = i < n ? this.list[i] : this.grace[i - n], drop = d.drops.get(p)
+        if (!drop) continue
+        const from = drop.agreement.fromTick
+        if (from === null) {
+          all = false
+          if (now - drop.since > (this.cfg.dropWaitMs ?? DEFAULT_DROP_WAIT_MS)) {
+            for (const q of d.peers) if (this.roster.live[q] && !drop.seen[q]) this.peerLost(q, now)
+          }
+        } else {
+          last = Math.max(last, from - 1)
+          if (drop.from === Infinity) {
+            drop.from = from
+            if (from < d.sim.tick) d.rollbackTick = Math.min(d.rollbackTick, from)
+          }
+        }
+      }
+      if (all) {
+        this.lost[p] = 2
+        this.stats.lostPeers.push(p)
+        this.onPeerLost?.(p, last)
+      }
+    }
+  }
+
+  private driveBots(now: number): void {
+    const n = this.list.length
+    for (let k = 0; k < n + this.grace.length; k++) {
+      const d = k < n ? this.list[k] : this.grace[k - n]
+      for (let i = 0; i < d.inputs.seats.length; i++) {
+        const seat = d.inputs.seats[i], buf = d.inputs.buffers[i]
+        const drop = d.drops.get(this.seatOwner[seat])
+        if (now - this.lastNews[this.seatOwner[seat]] <= this.tuning.botTakeoverMs && buf.lastTick < (drop?.from ?? d.start)) continue
+        const end = Math.min(this.tick + this.delayCtl.current, d.end - 1, this.limit - 1)
+        for (let t = Math.max(d.start, buf.lastTick + 1); t <= end; t++) {
+          const host = this.hostAt(d, seat, t)
+          if (host !== this.cfg.localPeer || host === this.seatOwner[seat]) break
+          this.codec.decode(this.codec.neutral, this.bot)
+          this.cfg.botInput?.(seat, t, this.bot)
+          this.storeSeat(d, seat, t, this.codec.encode(this.bot))
+        }
+      }
+    }
+  }
+
+  private news(peer: number): void {
+    const now = this.net!.now()
+    this.lastNews[peer] = now
+    if (!this.lost[peer]) return
+    this.lost[peer] = 0
+    this.roster.live[peer] = true
+    this.rejoinAt[peer] = this.limit
+    const at = this.stats.lostPeers.indexOf(peer)
+    if (at >= 0) this.stats.lostPeers.splice(at, 1)
+    for (const d of this.list) {
+      if (!d.peers.includes(peer)) d.peers.push(peer)
+      for (const link of this.shadowOut.get(d) ?? []) {
+        if (!link.peers.includes(peer)) link.peers.push(peer)
+        link.sent = Math.max(d.start - 1, d.confirmed - this.maxPrediction)
+      }
+      if (!d.producer) continue
+      const bytes = d.ring.bytesAt(d.confirmed)
+      if (bytes) for (const part of this.writer.domainSnapshotParts(this.cfg.localPeer, d.spec.id, d.confirmed, bytes)) this.net!.send(peer, 'reliable', part)
+    }
+  }
+
+  private recordSleep(domain: DomainId, id: number, tick: number, asleep: boolean, send: boolean): void {
+    let table = this.sleepTables.get(domain)
+    if (!table) this.sleepTables.set(domain, table = new SleepWakeDedupe(domain))
+    // Register only on first sight; the recovery table retains (id, tick, state) thereafter.
+    table.register(id)
+    if (!table.record(id, tick, asleep)) return
+    this.stats.sleepTransitions++
+    this.cfg.onSleep?.(domain, id, tick, asleep)
+    if (send) this.fanOut(this.others, 'reliable', asleep
+      ? this.writer.sleep(this.cfg.localPeer, domain, id, tick, EMPTY_BYTES)
+      : this.writer.wake(this.cfg.localPeer, domain, id, tick))
+  }
+
+  private updateDelay(_now: number): number { return this.delayCtl.current }
+
+  private farOut(d: DomainState<TInput>, tick: number): void {
+    if (!d.producer || tick <= d.start) return
+    const schedule = d.end === Infinity ? this.farSchedule : this.prevFarSchedule
+    for (const peer of this.others) {
+      if (!schedule.due(d.spec.id, peer, tick)) continue
+      const stride = schedule.strideOf(d.spec.id, peer), w = this.shadowW
+      w.reset()
+      d.sim.far(w, stride)
+      if (w.length < 2) continue
+      // DomainSim.far's u16 entry count is promoted into the FAR header.
+      const bytes = writerBuf(w), count = bytes[0] | (bytes[1] << 8)
+      this.farLog.store(0, w)
+      this.net!.send(peer, 'fast', this.writer.far(this.cfg.localPeer, d.spec.id, tick, stride, count, this.farLog.payload(0, 2)))
+    }
+  }
 }
 
 /**
@@ -1281,7 +1622,7 @@ function wiring(a: Assignment, id: DomainId): string {
   const s = a.domains.find((x) => x.id === id)!
   const out = a.shadows.filter((l) => l.from === id).map((l) => [l.to, a.domains.find((x) => x.id === l.to)?.replicas])
   const g = a.domains.find((x) => x.kind === 'global')
-  return JSON.stringify([s.seats, s.cells, s.replicas, DomainFrontier.inbound(s, a.shadows, a.domains), out, g ? [g.id, g.replicas] : null])
+  return JSON.stringify([s.seats.map((seat) => a.seatHost[seat]), s.seats, s.cells, s.replicas, DomainFrontier.inbound(s, a.shadows, a.domains), out, g ? [g.id, g.replicas] : null])
 }
 
 const EMPTY_BYTES = new Uint8Array(0)
@@ -1328,13 +1669,13 @@ class ShadowOutRing {
   }
 
   /** The payload of a tick, or an empty one when it is no longer held. */
-  payload(tick: number): Uint8Array {
+  payload(tick: number, skip = 0): Uint8Array {
     const s = tick % this.ticks.length
     if (this.ticks[s] !== tick) return EMPTY_BYTES
     const n = this.lens[s]
     let v = this.views[s][n]
     if (!v) {
-      v = this.bufs[s].subarray(0, n)
+      v = this.bufs[s].subarray(skip, n)
       this.views[s][n] = v
     }
     return v
