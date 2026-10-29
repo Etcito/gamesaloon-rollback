@@ -2,6 +2,7 @@
 // A virtual clock in ms; packets are delivered in (due time, sequence) order.
 // The same seed and the same send sequence give identical deliveries.
 import { Rng } from './rng.ts'
+import { MAX_PEERS } from './timing.ts'
 import type { NetChannel, NetTransport } from './types.ts'
 
 export interface NetSimOptions {
@@ -13,6 +14,9 @@ export interface NetSimOptions {
   /** Fast channel probability of an extra delay of one jitter span (2 × jitterMs). */
   reorder?: number
 }
+
+/** One direction's overrides; unset fields fall back to the global options. */
+export type LinkOptions = Partial<Omit<NetSimOptions, 'seed'>>
 
 interface Packet {
   from: number
@@ -46,6 +50,11 @@ export class NetSim {
   private readonly dead: boolean[]
   /** Last reliable due time per (from * n + to) pair. */
   private readonly lastReliableDue: number[]
+  /** Per-direction overrides, indexed from * n + to. */
+  private readonly links: (LinkOptions | null)[] = []
+  /** Group id per peer; everyone shares group 0 until partition(). */
+  private readonly group: Int32Array
+  private readonly listed: Uint8Array
   private readonly pending: Packet[] = []
   private readonly dueScratch: Packet[] = []
   private readonly inbox: Packet[][]
@@ -56,6 +65,7 @@ export class NetSim {
   private readonly transports: NetTransport[]
 
   constructor(peers: number, opts: NetSimOptions) {
+    if (!(peers >= 1 && peers <= MAX_PEERS)) throw new Error('[netsim] peers must be 1..MAX_PEERS')
     this.n = peers
     this.opts = { reorder: 0, ...opts }
     this.rng = new Rng(opts.seed)
@@ -64,7 +74,12 @@ export class NetSim {
     this.handed = []
     this.transports = []
     this.lastReliableDue = []
-    for (let i = 0; i < peers * peers; i++) this.lastReliableDue.push(0)
+    this.group = new Int32Array(peers)
+    this.listed = new Uint8Array(peers)
+    for (let i = 0; i < peers * peers; i++) {
+      this.lastReliableDue.push(0)
+      this.links.push(null)
+    }
     for (let p = 0; p < peers; p++) {
       this.dead.push(false)
       this.inbox.push([])
@@ -97,7 +112,7 @@ export class NetSim {
     due.sort(byDueThenSeq)
     for (let i = 0; i < due.length; i++) {
       const p = due[i]
-      if (this.dead[p.from] || this.dead[p.to]) this.release(p)
+      if (this.dead[p.from] || this.dead[p.to] || this.group[p.from] !== this.group[p.to]) this.release(p)
       else this.inbox[p.to].push(p)
     }
     due.length = 0
@@ -125,28 +140,65 @@ export class NetSim {
     if (o.reorder !== undefined) this.opts.reorder = o.reorder
   }
 
+  /** Overrides one direction only (a→b); out-of-range ids are ignored. */
+  setLink(a: number, b: number, opts: LinkOptions): void {
+    if (a < 0 || a >= this.n || b < 0 || b >= this.n) return
+    const i = a * this.n + b
+    const prev = this.links[i]
+    this.links[i] = prev ? Object.assign(prev, opts) : { ...opts }
+  }
+
+  /** Peers not listed are each alone. A partition is silent loss, not a known close. */
+  partition(groups: readonly (readonly number[])[]): void {
+    this.group.fill(0)
+    this.listed.fill(0)
+    let g = 0
+    for (let i = 0; i < groups.length; i++) {
+      const members = groups[i]
+      for (let j = 0; j < members.length; j++) {
+        const p = members[j]
+        if (p < 0 || p >= this.n) continue
+        this.group[p] = g
+        this.listed[p] = 1
+      }
+      g++
+    }
+    for (let p = 0; p < this.n; p++) if (!this.listed[p]) this.group[p] = g++
+  }
+
+  /** Clears the partition only; link overrides stay. */
+  heal(): void {
+    this.group.fill(0)
+  }
+
   private isClosed(a: number, b: number): boolean {
     return a < 0 || a >= this.n || b < 0 || b >= this.n || this.dead[a] || this.dead[b]
   }
 
-  private latency(): number {
-    const j = this.opts.jitterMs
-    const d = this.opts.rttMs / 2 + (j > 0 ? this.rng.range(-j, j) : 0)
+  private latency(from: number, to: number): number {
+    const link = this.links[from * this.n + to]
+    const j = link?.jitterMs ?? this.opts.jitterMs
+    const rtt = link?.rttMs ?? this.opts.rttMs
+    const d = rtt / 2 + (j > 0 ? this.rng.range(-j, j) : 0)
     return d < 0 ? 0 : d
   }
 
   private send(from: number, to: number, ch: NetChannel, data: Uint8Array): void {
     if (from === to || this.isClosed(from, to)) return
+    // A partition drops before any Rng draw, so it does not shift the stream.
+    if (this.group[from] !== this.group[to]) return
+    const link = this.links[from * this.n + to]
     let due: number
     if (ch === 'fast') {
-      // Fixed draw order per fast packet: loss, jitter, reorder.
-      const lost = this.rng.next() < this.opts.loss
-      due = this.clock + this.latency()
-      const reorder = this.rng.next() < (this.opts.reorder ?? 0)
+      // Fixed draw order per fast packet: loss, jitter, reorder. With no link override and no
+      // partition this is exactly the original sequence, so existing tests replay identically.
+      const lost = this.rng.next() < (link?.loss ?? this.opts.loss)
+      due = this.clock + this.latency(from, to)
+      const reorder = this.rng.next() < (link?.reorder ?? this.opts.reorder ?? 0)
       if (lost) return
-      if (reorder) due += 2 * this.opts.jitterMs
+      if (reorder) due += 2 * (link?.jitterMs ?? this.opts.jitterMs)
     } else {
-      due = this.clock + this.latency()
+      due = this.clock + this.latency(from, to)
       const pair = from * this.n + to
       if (due < this.lastReliableDue[pair]) due = this.lastReliableDue[pair]
       this.lastReliableDue[pair] = due
