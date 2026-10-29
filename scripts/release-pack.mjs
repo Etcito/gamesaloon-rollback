@@ -20,7 +20,7 @@ const PACKAGES = [
     dir: 'packages/core',
     npmName: '@gamesaloon/rollback',
     asset: 'gamesaloon-rollback',
-    required: ['package/package.json', 'package/dist/index.js', 'package/dist/index.d.ts', 'package/dist/netsim.js'],
+    required: ['package/package.json', 'package/dist/index.js', 'package/dist/index.d.ts', 'package/dist/netsim.js', 'package/dist/zones/index.js'],
   },
   {
     dir: 'packages/rapier',
