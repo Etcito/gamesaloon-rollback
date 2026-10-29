@@ -42,7 +42,10 @@ function mix(h: number, v: number): number {
   return Math.imul(h ^ (v >>> 24), FNV)
 }
 
-interface MutSleep { id: number; tick: number; asleep: boolean }
+interface MutSleep { id: number; tick: number; asleep: boolean; pose: Uint8Array; full: Uint8Array; dv: DataView }
+
+// WAKE carries no pose; one shared buffer keeps sleepEvents allocation-free.
+const NO_POSE = new Uint8Array(0)
 
 export class ZonePointSim implements DomainSim<PointInput> {
   tick: number
@@ -105,7 +108,10 @@ export class ZonePointSim implements DomainSim<PointInput> {
     this.gvx = new Int32Array(opts.maxGhosts)
     this.gvy = new Int32Array(opts.maxGhosts)
     this.evId = new Uint32Array(opts.maxEvents)
-    for (let i = 0; i < cap; i++) this.sleepPool.push({ id: 0, tick: 0, asleep: false })
+    for (let i = 0; i < cap; i++) {
+      const full = new Uint8Array(8)
+      this.sleepPool.push({ id: 0, tick: 0, asleep: false, pose: NO_POSE, full, dv: new DataView(full.buffer) })
+    }
     let seed = mix(0x811c9dc5, spec.id)
     for (const c of spec.cells) seed = mix(seed, c)
     this.rng = new Rng(seed)
@@ -216,15 +222,31 @@ export class ZonePointSim implements DomainSim<PointInput> {
     if (!this.asleep[i]) return
     this.asleep[i] = 0
     this.still[i] = 0
-    this.pushSleep(this.id[i], false)
+    this.pushSleep(i, false)
   }
 
-  private pushSleep(id: number, asleep: boolean): void {
+  // Pose = the x, y i32 of the snapshot record, so it matches sleepPose byte for byte.
+  private pushSleep(i: number, asleep: boolean): void {
     if (this.sleepN >= this.sleepPool.length) return
     const e = this.sleepPool[this.sleepN++]
-    e.id = id
+    e.id = this.id[i]
     e.tick = this.tick
     e.asleep = asleep
+    if (asleep) {
+      e.dv.setInt32(0, this.x[i], true)
+      e.dv.setInt32(4, this.y[i], true)
+      e.pose = e.full
+    } else e.pose = NO_POSE
+  }
+
+  sleepPose(id: number, w: SnapWriter): boolean {
+    for (let i = 0; i < this.n; i++) {
+      if (this.id[i] !== id) continue
+      w.i32(this.x[i])
+      w.i32(this.y[i])
+      return true
+    }
+    return false
   }
 
   step(inputs: readonly PointInput[], shadows: ShadowView): void {
@@ -340,7 +362,7 @@ export class ZonePointSim implements DomainSim<PointInput> {
         if (++this.still[i] >= o.sleepTicks) {
           this.asleep[i] = 1
           this.sleepTick[i] = this.tick
-          this.pushSleep(this.id[i], true)
+          this.pushSleep(i, true)
         }
       } else this.still[i] = 0
     }
