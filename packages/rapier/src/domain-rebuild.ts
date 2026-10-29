@@ -313,26 +313,22 @@ export type ShadowProxyBuilder = (id: EntityId) => { body: RAPIER.RigidBodyDesc;
 
 const NO_COLLIDERS: RAPIER.ColliderDesc[] = [];
 
-interface LinkProxies {
-  /** Every id ever proxied for this source, so a restore can still be reconciled. */
-  readonly all: number[];
-  readonly known: Set<number>;
-  /** Reused membership set of the payload being read. */
-  readonly seen: Set<number>;
-}
-
 /**
  * Drives one kinematic proxy body per (source domain, source entity id). The inbound payload is what
  * RapierDomainSim.shadowOut writes for the link:
  *   u16 count, then per entity: id u32, translation xyz f64, rotation xyzw f64.
- * The pose is snapshot-form. An absent id is removed only when a payload actually arrived: a zero-length reader
- * means "no SHADOW yet", so that link is skipped without reading. Scratch vectors and sets are reused.
+ * The pose is snapshot-form. Presence is reconciled against the world's proxy table, which a restored
+ * DOMAIN_SNAPSHOT fills, so a fresh instance still drops stale proxies. An absent id is removed only when a
+ * payload actually arrived: a zero-length reader means "no SHADOW yet", so that link is skipped without reading.
+ * Scratch vectors, arrays and the membership set are reused.
  */
 export class ShadowProxies {
   readonly #R: RapierModule;
   readonly #world: RapierDomainWorld;
   readonly #build: ShadowProxyBuilder | undefined;
-  readonly #links = new Map<number, LinkProxies>();
+  readonly #seen = new Set<number>();
+  readonly #table: EntityId[] = [];
+  readonly #stale: EntityId[] = [];
   readonly #t = { x: 0, y: 0, z: 0 };
   readonly #q = { x: 0, y: 0, z: 0, w: 1 };
 
@@ -347,12 +343,8 @@ export class ShadowProxies {
       const from = shadows.fromDomain(i);
       const r = shadows.reader(i);
       if (r.remaining === 0) continue;
-      let link = this.#links.get(from);
-      if (!link) {
-        link = { all: [], known: new Set(), seen: new Set() };
-        this.#links.set(from, link);
-      }
-      link.seen.clear();
+      const seen = this.#seen;
+      seen.clear();
       const n = r.u16();
       for (let k = 0; k < n; k++) {
         const id = r.u32();
@@ -365,7 +357,7 @@ export class ShadowProxies {
         q.y = r.f64();
         q.z = r.f64();
         q.w = r.f64();
-        link.seen.add(id);
+        seen.add(id);
         let body = this.#world.proxyBody(from, id);
         if (body === undefined) {
           body = this.#create(id);
@@ -374,18 +366,16 @@ export class ShadowProxies {
         const rb = this.#world.sim.body(body);
         rb.setNextKinematicTranslation(t);
         rb.setNextKinematicRotation(q);
-        if (!link.known.has(id)) {
-          link.known.add(id);
-          link.all.push(id);
-        }
       }
-      // A restore may bring back proxies removed after that snapshot, so reconcile every id ever seen.
-      for (let k = link.all.length - 1; k >= 0; k--) {
-        const id = link.all[k];
-        if (link.seen.has(id)) continue;
-        if (this.#world.proxyBody(from, id) === undefined) continue;
-        this.#world.removeProxy(from, id);
+      // The table is the single source of truth: collect first, then remove in ascending id.
+      this.#world.proxyIds(from, this.#table);
+      const stale = this.#stale;
+      stale.length = 0;
+      for (let k = 0; k < this.#table.length; k++) {
+        const id = this.#table[k];
+        if (!seen.has(id)) stale.push(id);
       }
+      for (let k = 0; k < stale.length; k++) this.#world.removeProxy(from, stale[k]);
     }
   }
 
