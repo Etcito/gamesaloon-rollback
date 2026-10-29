@@ -228,6 +228,15 @@ export class RapierDomainWorld {
     return this.#proxies.get(proxyKey(source, id))?.body;
   }
 
+  /** Clears `out`, then fills it with the source ids of every proxy of `source`, ascending. */
+  proxyIds(source: number, out: EntityId[]): void {
+    out.length = 0;
+    for (const p of this.#proxies.values()) {
+      if (p.source === source) out.push(p.id);
+    }
+    out.sort((a, b) => a - b);
+  }
+
   removeProxy(source: number, id: EntityId): void {
     const key = proxyKey(source, id);
     const p = this.#proxies.get(key);

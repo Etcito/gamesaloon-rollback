@@ -243,3 +243,26 @@ test("export lists entities and joints in strictly ascending id after restore", 
   assert.equal(r.remaining, 0);
   w.sim.free();
 });
+
+test("proxyIds lists one source's proxies in ascending id, also after restore", () => {
+  const w = makeWorld();
+  const kinematic = () => w.sim.createBody(R.RigidBodyDesc.kinematicPositionBased(), [R.ColliderDesc.ball(0.1)]);
+  w.setProxy(2, 7, kinematic());
+  w.setProxy(2, 3, kinematic());
+  w.setProxy(2, 5, kinematic());
+  w.setProxy(9, 4, kinematic());
+  const sw = new SnapWriter();
+  w.snapshot(sw);
+
+  const fresh = makeWorld();
+  fresh.restore(new SnapReader(sw.bytes().slice()));
+  const out: number[] = [9, 9];
+  fresh.proxyIds(2, out);
+  assert.deepStrictEqual(out, [3, 5, 7]);
+  fresh.proxyIds(9, out);
+  assert.deepStrictEqual(out, [4]);
+  fresh.proxyIds(1, out);
+  assert.deepStrictEqual(out, []);
+  w.sim.free();
+  fresh.sim.free();
+});
