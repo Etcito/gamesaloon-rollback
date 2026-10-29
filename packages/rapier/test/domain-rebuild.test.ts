@@ -229,6 +229,9 @@ test("a fresh ShadowProxies on a restored world drops proxies absent from a coun
   new ShadowProxies(R, restored).step(shadowView(7, shadowPayload([])));
   assert.equal(restored.proxyBody(7, 5), undefined, "no instance-local history: the table is reconciled");
   assert.equal(restored.proxyBody(7, 6), undefined);
+  const left: number[] = [];
+  restored.proxyIds(7, left);
+  assert.deepStrictEqual(left, [], "no proxy row left for the source");
 
   new ShadowProxies(R, original).step(shadowView(7, shadowPayload([])));
   original.step();
