@@ -3,8 +3,9 @@
 // neighbour domains arrive as read-only ghosts through the shadows. The global domain only keeps an event ledger.
 import { Rng, SnapReader, SnapWriter } from '../../src/index.ts'
 import type { SimView } from '../../src/index.ts'
-import type { DomainId, DomainSim, DomainSpec, SeatId, ShadowView, SleepEvent } from '../../src/zones/types.ts'
+import type { DomainFactory, DomainId, DomainSim, DomainSpec, SeatId, ShadowView, SleepEvent } from '../../src/zones/types.ts'
 import { LEFT, RIGHT, UP, DOWN, BOOST } from '../pointsim.ts'
+import type { InputCodec } from '../../src/index.ts'
 import type { PointInput } from '../pointsim.ts'
 
 export interface ZonePointOptions {
@@ -64,7 +65,8 @@ export class ZonePointSim implements DomainSim<PointInput> {
   /** Not simulation state: counts resims (test observation only). */
   resims = 0
   readonly view: SimView
-  private rng: Rng
+  /** Public so a rebuild can derive it from (domain id, tick). */
+  rng: Rng
   private seatIndex: Int32Array
   private wind: Int32Array
   private gx: Int32Array
@@ -80,11 +82,11 @@ export class ZonePointSim implements DomainSim<PointInput> {
   private minRow = 0
   private maxRow = 0
 
-  constructor(spec: DomainSpec, tick: number, opts: ZonePointOptions) {
+  constructor(spec: DomainSpec, tick: number, opts: ZonePointOptions, extraCap = 0) {
     this.spec = spec
     this.tick = tick
     this.opts = opts
-    const cap = spec.kind === 'global' ? 0 : spec.seats.length + spec.cells.length * opts.fieldPerCell
+    const cap = spec.kind === 'global' ? 0 : spec.seats.length + spec.cells.length * opts.fieldPerCell + extraCap
     this.id = new Uint32Array(cap)
     this.x = new Int32Array(cap)
     this.y = new Int32Array(cap)
@@ -490,4 +492,76 @@ export class ZonePointSim implements DomainSim<PointInput> {
   }
 
   endResim(): void {}
+}
+
+export const zonePointCodec: InputCodec<PointInput> = {
+  create: () => ({ mask: 0 }),
+  encode: (i) => i.mask & 0x1f,
+  decode: (code, out) => {
+    out.mask = code & 0x1f
+    return out
+  },
+  neutral: 0,
+}
+
+/** The cell of a seat's point in `sim`, or 0xFFFF (no cell) when the domain does not hold it. */
+export function seatCell(sim: ZonePointSim, seat: SeatId): number {
+  for (let i = 0; i < sim.n; i++) if (sim.id[i] === seat) return sim.cellOf(i)
+  return 0xffff
+}
+
+export class ZonePointFactory implements DomainFactory<PointInput> {
+  readonly opts: ZonePointOptions
+
+  constructor(opts: ZonePointOptions) {
+    this.opts = opts
+  }
+
+  create(spec: DomainSpec, tick: number): ZonePointSim {
+    return new ZonePointSim(spec, tick, this.opts)
+  }
+
+  /** Merge in ascending id, keep the entities in spec.cells or of spec.seats, rng from (domain id, tick). */
+  rebuild(spec: DomainSpec, tick: number, sources: SnapReader[]): ZonePointSim {
+    const o = this.opts
+    const recs: number[][] = []
+    for (const r of sources) {
+      const m = r.u32()
+      for (let k = 0; k < m; k++) recs.push([r.u32(), r.i32(), r.i32(), r.i32(), r.i32(), r.u8(), r.i32()])
+    }
+    recs.sort((a, b) => a[0] - b[0])
+    const kept: number[][] = []
+    for (const e of recs) {
+      if (kept.length > 0 && kept[kept.length - 1][0] === e[0]) continue
+      const isSeat = e[0] < o.seatCount && spec.seats.includes(e[0])
+      if (isSeat || (spec.kind !== 'global' && spec.cells.includes(cellAt(o, e[1], e[2])))) kept.push(e)
+    }
+    const sim = new ZonePointSim(spec, tick, o, kept.length)
+    if (spec.kind !== 'global') {
+      const w = new SnapWriter()
+      w.u32(kept.length)
+      for (const e of kept) {
+        w.u32(e[0])
+        for (let f = 1; f < 5; f++) w.i32(e[f])
+        w.u8(e[5])
+        w.i32(e[6])
+      }
+      sim.loadEntities([new SnapReader(w.bytes())])
+    }
+    sim.rng.state = mix(mix(0x811c9dc5, spec.id), tick)
+    return sim
+  }
+
+  /** Create's placement at `tick`, from the spec alone. */
+  reset(spec: DomainSpec, tick: number): ZonePointSim {
+    return new ZonePointSim(spec, tick, this.opts)
+  }
+}
+
+function cellAt(o: ZonePointOptions, x: number, y: number): number {
+  let col = Math.floor(x / o.cellSize)
+  let row = Math.floor(y / o.cellSize)
+  col = col < 0 ? 0 : col >= o.gridCols ? o.gridCols - 1 : col
+  row = row < 0 ? 0 : row >= o.gridRows ? o.gridRows - 1 : row
+  return row * o.gridCols + col
 }
