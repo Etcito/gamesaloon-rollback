@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ZMSG, ZoneWireWriter, decodeZone } from '../src/zones/wire.ts'
-import { decode } from '../src/wire.ts'
+import { MAX_WIRE_TICKS, decode } from '../src/wire.ts'
 
 test('zone message types occupy 16 through 24', () => {
   assert.deepEqual(ZMSG, {
@@ -131,4 +131,80 @@ test('writer reuses one growable buffer and cached views; decoder reuses each me
     assert.equal(decodeZone(frame), msg)
     assert.equal(msg.from, 62)
   }
+})
+
+const zcontrol = (count: number, seats: number) => ({
+  type: ZMSG.CONTROL, from: 63, firstTick: 1000, count, seats,
+  seatIds: Uint16Array.from([0, 7, 0x1234, 0xfffe]).subarray(0, seats),
+  words: Uint32Array.from({ length: count * seats }, (_, i) => (0xf0000000 + i * 0x01010101) >>> 0),
+})
+
+test('CONTROL round-trips 4 seats x 3 ticks from peer 63', () => {
+  const src = zcontrol(3, 4)
+  const m = decodeZone(new ZoneWireWriter().control(src))
+  assert.ok(m && m.type === ZMSG.CONTROL)
+  assert.equal(m.from, 63)
+  assert.equal(m.firstTick, 1000)
+  assert.equal(m.count, 3)
+  assert.equal(m.seats, 4)
+  assert.deepEqual([...m.seatIds], [0, 7, 0x1234, 0xfffe])
+  assert.deepEqual([...m.words], [...src.words])
+})
+
+test('ZINPUT round-trips 2 seats x 5 ticks with ackTick -1 and three checks', () => {
+  const checks = [{ domain: 0, tick: 10, hash: 0xdeadbeef }, { domain: 5, tick: -1, hash: 1 }, { domain: 0xfffe, tick: 99, hash: 0xffffffff }]
+  const codes = Uint32Array.from({ length: 10 }, (_, i) => i * 0x11111111 >>> 0)
+  const m = decodeZone(new ZoneWireWriter().zinput({
+    type: ZMSG.ZINPUT, from: 63, domain: 300, ackTick: -1, firstTick: 42, count: 5, seats: 2,
+    seatIds: Uint16Array.from([3, 0xfffe]), codes, senderTick: 47, checks,
+  }))
+  assert.ok(m && m.type === ZMSG.ZINPUT)
+  assert.equal(m.from, 63)
+  assert.equal(m.domain, 300)
+  assert.equal(m.ackTick, -1)
+  assert.equal(m.firstTick, 42)
+  assert.equal(m.count, 5)
+  assert.equal(m.seats, 2)
+  assert.deepEqual([...m.seatIds], [3, 0xfffe])
+  assert.deepEqual([...m.codes], [...codes])
+  assert.equal(m.senderTick, 47)
+  assert.deepEqual(m.checks.map((c) => ({ ...c })), checks)
+})
+
+test('count 200 is clamped to MAX_WIRE_TICKS', () => {
+  const m = decodeZone(new ZoneWireWriter().control(zcontrol(200, 1)))
+  assert.ok(m && m.type === ZMSG.CONTROL)
+  assert.equal(m.count, MAX_WIRE_TICKS)
+  assert.equal(m.words.length, MAX_WIRE_TICKS)
+})
+
+test('CONTROL and ZINPUT reject every truncation and one extra byte', () => {
+  const w = new ZoneWireWriter()
+  const frames = [
+    w.control(zcontrol(3, 4)).slice(),
+    w.zinput({
+      type: ZMSG.ZINPUT, from: 1, domain: 2, ackTick: 0, firstTick: 0, count: 2, seats: 2,
+      seatIds: Uint16Array.from([1, 2]), codes: new Uint32Array(4), senderTick: 0, checks: [{ domain: 1, tick: 2, hash: 3 }],
+    }).slice(),
+  ]
+  for (const f of frames) {
+    assert.ok(decodeZone(f))
+    for (let cut = 0; cut < f.length; cut++) assert.equal(decodeZone(f.subarray(0, cut)), null, `cut ${cut}`)
+    const longer = new Uint8Array(f.length + 1)
+    longer.set(f)
+    assert.equal(decodeZone(longer), null)
+  }
+})
+
+test('seats = 9 in a hand-built frame is rejected', () => {
+  const c = new Uint8Array(8 + 9 * 2 + 9 * 4)
+  c[0] = ZMSG.CONTROL
+  c[6] = 1
+  c[7] = 9
+  assert.equal(decodeZone(c), null)
+  const z = new Uint8Array(14 + 9 * 2 + 9 * 4 + 5)
+  z[0] = ZMSG.ZINPUT
+  z[12] = 1
+  z[13] = 9
+  assert.equal(decodeZone(z), null)
 })
