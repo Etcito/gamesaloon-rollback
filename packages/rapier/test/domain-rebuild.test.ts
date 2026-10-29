@@ -2,12 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert";
 import { SnapReader, SnapWriter } from "@gamesaloon/rollback";
 import type { DomainSpec, ShadowView, SleepEvent } from "@gamesaloon/rollback/zones";
-import { initRapier, RapierDomainWorld } from "../src/index.ts";
+import { getR, mulberry32 } from "./scenario.ts";
+import { RapierDomainWorld } from "../src/index.ts";
 import type { DomainEntityBuilder, DomainJointBuilder } from "../src/index.ts";
 import { exportEntities, kinematicByTick, mergeEntityStreams, rebuildDomain, ShadowProxies } from "../src/domain-rebuild.ts";
-import type { KinematicPart, KinematicPose } from "../src/domain-rebuild.ts";
+import type { EntityExport, KinematicPart, KinematicPose } from "../src/domain-rebuild.ts";
 
-const R = await initRapier();
+const R = await getR();
 
 const KIND_GROUND = 0;
 const KIND_BALL = 1;
@@ -240,4 +241,246 @@ test("kinematic-by-tick parts follow the tick and stay out of the entity table",
   assert.deepStrictEqual(merged(exportBytes(world)).entities, []);
   world.sim.free();
   empty.sim.free();
+});
+
+// ---- Two domains A and B on a cell grid: two-peer rebuild, split/merge hash equality ----
+
+/** Cells are 4 m wide along x, from x = -8: A owns cells 0-1 (x < 0), B owns cells 2-3. */
+const GRID_ORIGIN_X = -8;
+const GRID_CELL = 4;
+const GRID_COLS = 4;
+const SEED = 0x5eed;
+const STEPS = 100;
+const B_FIRST_ID = 101;
+const JOINT_STACK = 0;
+const JOINT_ROPE = 1;
+const STACK_HALF = 0.6;
+const ROPE_LENGTH = 4;
+
+const SPEC_A: DomainSpec = { id: 1, kind: "seat", cells: [0, 1], seats: [0], replicas: [0, 1] };
+const SPEC_B: DomainSpec = { id: 2, kind: "seat", cells: [2, 3], seats: [1], replicas: [0, 1] };
+const SPEC_M: DomainSpec = { id: 1, kind: "seat", cells: [0, 1, 2, 3], seats: [0, 1], replicas: [0, 1] };
+
+function cellOf(x: number): number {
+  const col = Math.floor((x - GRID_ORIGIN_X) / GRID_CELL);
+  return Math.min(GRID_COLS - 1, Math.max(0, col));
+}
+
+/** Test-local membership: the cell under the entity's translation is one of the spec's cells. */
+function belongsTo(spec: DomainSpec): (e: EntityExport) => boolean {
+  return (e) => spec.cells.includes(cellOf(e.translation.x));
+}
+
+function posParams(x: number, y: number, z: number): Uint8Array {
+  const p = new Uint8Array(24);
+  const dv = new DataView(p.buffer);
+  dv.setFloat64(0, x, true);
+  dv.setFloat64(8, y, true);
+  dv.setFloat64(16, z, true);
+  return p;
+}
+
+/** Every entity is a dynamic ball whose spawn position is its params; the ground is static level. */
+const buildBall: DomainEntityBuilder = (_kind, params) => {
+  const dv = new DataView(params.buffer, params.byteOffset, params.byteLength);
+  const body = R.RigidBodyDesc.dynamic().setTranslation(dv.getFloat64(0, true), dv.getFloat64(8, true), dv.getFloat64(16, true));
+  return { body, colliders: [R.ColliderDesc.ball(0.5).setFriction(0.7)] };
+};
+
+const buildDomainJoint: DomainJointBuilder = (world, kind, _params, a, b) => {
+  const data = kind === JOINT_STACK
+    ? R.JointData.spherical({ x: 0, y: STACK_HALF, z: 0 }, { x: 0, y: -STACK_HALF, z: 0 })
+    : R.JointData.rope(ROPE_LENGTH, { x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0 });
+  return world.createImpulseJoint(data, a, b, true);
+};
+
+function buildGround(world: RapierDomainWorld): void {
+  world.sim.createBody(R.RigidBodyDesc.fixed().setTranslation(0, -0.5, 0), [R.ColliderDesc.cuboid(20, 0.5, 20)]);
+}
+
+function freshDomain(): RapierDomainWorld {
+  const w = new RapierDomainWorld(R, buildBall, buildDomainJoint);
+  buildGround(w);
+  return w;
+}
+
+interface TwoDomains {
+  a: RapierDomainWorld;
+  b: RapierDomainWorld;
+  /** A's end and B's end of the joint that only a merged world can hold. */
+  crossA: number;
+  crossB: number;
+  stackJoint: number;
+}
+
+/**
+ * A: a jointed stack (ids 1, 2), a loose ball and the A end of the cross joint (x = -1.5).
+ * B: from id 101, the B end of the cross joint (x = 1.5) and two loose balls. Offsets come from the seed.
+ */
+function buildTwoDomains(seed: number): TwoDomains {
+  const rnd = mulberry32(seed);
+  const jitter = (): number => (rnd() - 0.5) * 0.4;
+  const a = freshDomain();
+  const s0 = a.spawn(0, posParams(-5 + jitter(), 1, jitter()), 0);
+  const s1 = a.spawn(0, posParams(-5 + jitter(), 1 + 2 * STACK_HALF, jitter()), 0);
+  const stackJoint = a.join(s0, s1, JOINT_STACK, NO_PARAMS);
+  a.spawn(0, posParams(-3 + jitter(), 1, 1 + jitter()), 0);
+  const crossA = a.spawn(0, posParams(-1.5 + jitter(), 1, jitter()), 0);
+
+  const b = freshDomain();
+  const crossB = b.adopt(B_FIRST_ID, 0, posParams(1.5 + jitter(), 1, jitter()), 1);
+  b.spawn(0, posParams(3 + jitter(), 1, -1 + jitter()), 1);
+  b.spawn(0, posParams(5 + jitter(), 1.5, 1 + jitter()), 1);
+  return { a, b, crossA, crossB, stackJoint };
+}
+
+function rebuildFrom(spec: DomainSpec, tick: number, sources: readonly Uint8Array[]): RapierDomainWorld {
+  return rebuildDomain({
+    R,
+    spec,
+    tick,
+    sources: sources.map((s) => new SnapReader(s)),
+    buildEntity: buildBall,
+    buildJoint: buildDomainJoint,
+    buildStatic: (w) => buildGround(w),
+    belongs: belongsTo(spec),
+  });
+}
+
+function ids(w: RapierDomainWorld): { entities: number[]; joints: number[] } {
+  const m = merged(exportBytes(w));
+  return { entities: m.entities.map((e) => e.id), joints: m.joints.map((j) => j.id) };
+}
+
+function assertReplicasAgree(p: RapierDomainWorld, q: RapierDomainWorld, what: string): void {
+  assert.equal(p.tick, q.tick, `${what}: tick`);
+  assert.equal(p.hash(), q.hash(), `${what}: hash`);
+  assert.deepStrictEqual(exportBytes(p), exportBytes(q), `${what}: export`);
+}
+
+interface MergedPair {
+  two: TwoDomains;
+  /** Peer 1 and peer 2 replicas of the merged domain, each with the cross joint added after the merge. */
+  m1: RapierDomainWorld;
+  m2: RapierDomainWorld;
+  crossJoint: number;
+  sourceMax: number;
+}
+
+/** Both peers rebuild A+B; peer 2 receives the sources in the other order. Both then add the cross joint. */
+function mergeOnTwoPeers(): MergedPair {
+  const two = buildTwoDomains(SEED);
+  stepN(two.a, STEPS);
+  stepN(two.b, STEPS);
+  const aBytes = exportBytes(two.a);
+  const bBytes = exportBytes(two.b);
+  const m1 = rebuildFrom(SPEC_M, two.a.tick, [aBytes, bBytes]);
+  const m2 = rebuildFrom(SPEC_M, two.a.tick, [bBytes, aBytes]);
+  const sourceMax = Math.max(...ids(two.a).entities, ...ids(two.b).entities);
+  const crossJoint = m1.join(two.crossA, two.crossB, JOINT_ROPE, NO_PARAMS);
+  assert.equal(m2.join(two.crossA, two.crossB, JOINT_ROPE, NO_PARAMS), crossJoint);
+  return { two, m1, m2, crossJoint, sourceMax };
+}
+
+function freeAll(...worlds: RapierDomainWorld[]): void {
+  for (const w of worlds) w.sim.free();
+}
+
+function split(m: RapierDomainWorld): [RapierDomainWorld, RapierDomainWorld] {
+  const bytes = exportBytes(m);
+  return [rebuildFrom(SPEC_A, m.tick, [bytes]), rebuildFrom(SPEC_B, m.tick, [bytes])];
+}
+
+test("two-peer rebuild: both peers merge A and B into the same domain and stay equal", () => {
+  const { two, m1, m2, sourceMax } = mergeOnTwoPeers();
+  assert.equal(m1.tick, two.a.tick);
+  assertReplicasAgree(m1, m2, "merged at rebuild");
+  const m = ids(m1);
+  assert.deepStrictEqual(m.entities, [...ids(two.a).entities, ...ids(two.b).entities], "ascending ids of both sources");
+  assert.ok(m.entities.every((id) => id <= sourceMax));
+  assert.ok(m.joints.includes(two.stackJoint), "the joint inside A survives the merge under its id");
+  stepN(m1, STEPS);
+  stepN(m2, STEPS);
+  assertReplicasAgree(m1, m2, "merged after stepping");
+  freeAll(two.a, two.b, m1, m2);
+});
+
+test("split then merge agrees on two replicas of each domain", () => {
+  const { two, m1, m2 } = mergeOnTwoPeers();
+  stepN(m1, STEPS);
+  stepN(m2, STEPS);
+  const [a1, b1] = split(m1);
+  const [a2, b2] = split(m2);
+  assertReplicasAgree(a1, a2, "A at split");
+  assertReplicasAgree(b1, b2, "B at split");
+  assert.equal(ids(a1).entities.length + ids(b1).entities.length, ids(m1).entities.length, "every entity lands in one domain");
+  for (const w of [a1, b1, a2, b2]) stepN(w, STEPS);
+  assertReplicasAgree(a1, a2, "A after stepping");
+  assertReplicasAgree(b1, b2, "B after stepping");
+
+  const again1 = rebuildFrom(SPEC_M, a1.tick, [exportBytes(a1), exportBytes(b1)]);
+  const again2 = rebuildFrom(SPEC_M, a2.tick, [exportBytes(b2), exportBytes(a2)]);
+  assertReplicasAgree(again1, again2, "merged again");
+  assert.deepStrictEqual(ids(again1).entities, ids(m1).entities);
+  stepN(again1, STEPS);
+  stepN(again2, STEPS);
+  assertReplicasAgree(again1, again2, "merged again after stepping");
+  freeAll(two.a, two.b, m1, m2, a1, b1, a2, b2, again1, again2);
+});
+
+test("the cross-domain joint is cut by the split, with the same joint ids on both replicas", () => {
+  const { two, m1, m2, crossJoint } = mergeOnTwoPeers();
+  assert.ok(ids(m1).joints.includes(crossJoint));
+  const [a1, b1] = split(m1);
+  const [a2, b2] = split(m2);
+  assert.ok(ids(a1).entities.includes(two.crossA) && ids(b1).entities.includes(two.crossB), "each end stays in its domain");
+  assert.deepStrictEqual(ids(a1).joints, [two.stackJoint], "A keeps only its inner joint");
+  assert.deepStrictEqual(ids(b1).joints, []);
+  assert.deepStrictEqual(ids(a2).joints, ids(a1).joints);
+  assert.deepStrictEqual(ids(b2).joints, ids(b1).joints);
+  freeAll(two.a, two.b, m1, m2, a1, b1, a2, b2);
+});
+
+test("ids are not reused: bodies and joints created after a rebuild get ids above every source id", () => {
+  const { two, m1, m2, crossJoint, sourceMax } = mergeOnTwoPeers();
+  assert.ok(crossJoint > two.stackJoint, "the joint added after the merge is above the source joint ids");
+  const spawned = m1.spawn(0, posParams(0, 3, 0), 0);
+  assert.ok(spawned > sourceMax, `spawned id ${spawned} must exceed ${sourceMax}`);
+
+  // B never held A's ids, yet its counters continue above everything the merged source carried.
+  const [a1, b1] = split(m2);
+  const mergedMax = Math.max(...ids(m2).entities);
+  const inB = b1.spawn(0, posParams(4, 3, 0), 1);
+  assert.ok(inB > mergedMax, `B's new id ${inB} must exceed ${mergedMax}`);
+  assert.ok(b1.join(two.crossB, inB, JOINT_STACK, NO_PARAMS) > crossJoint, "a new joint in B is above the cut joint id");
+  assert.throws(() => b1.adopt(two.crossA, 0, posParams(0, 1, 0), 0), /never reused/);
+  freeAll(two.a, two.b, m1, m2, a1, b1);
+});
+
+test("a zero-length shadow reader leaves the domain world unchanged", () => {
+  const two = buildTwoDomains(SEED);
+  stepN(two.a, STEPS);
+  const before = new SnapWriter();
+  two.a.snapshot(before);
+  const hash = two.a.hash();
+  const proxies = new ShadowProxies(R, two.a);
+  const empty: ShadowView = { count: 2, fromDomain: (i) => (i === 0 ? SPEC_B.id : SPEC_M.id), reader: () => new SnapReader(new Uint8Array(0)) };
+  proxies.step(empty);
+  const after = new SnapWriter();
+  two.a.snapshot(after);
+  assert.equal(two.a.hash(), hash);
+  assert.deepStrictEqual(after.bytes(), before.bytes());
+  assert.equal(two.a.proxyBody(SPEC_B.id, two.crossB), undefined);
+  freeAll(two.a, two.b);
+});
+
+test("the merge does not depend on source order or on which peer's exports it reads", () => {
+  const { two, m1, m2 } = mergeOnTwoPeers();
+  const aBytes = exportBytes(two.a);
+  const bBytes = exportBytes(two.b);
+  assert.deepStrictEqual(merged(exportBytes(m1)), mergeEntityStreams([new SnapReader(exportBytes(m2))]));
+  const ab = mergeEntityStreams([new SnapReader(aBytes), new SnapReader(bBytes)]);
+  const ba = mergeEntityStreams([new SnapReader(bBytes), new SnapReader(aBytes)]);
+  assert.deepStrictEqual(ab, ba);
+  freeAll(two.a, two.b, m1, m2);
 });
