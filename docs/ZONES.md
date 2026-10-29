@@ -81,6 +81,11 @@ At S = E*K, as part of the step to tick S (and replayed on rollback):
 Each domain keeps an InputBuffer per member seat and per inbound shadow, a frontier (min over those), a snapshot
 ring and a hash ring. It stalls at `frontier + maxPrediction`, independently of other domains.
 
+Empty shadow rule: until the first SHADOW of a link is received, `ShadowView.reader(i)` returns a zero-length
+reader for that link, meaning nothing from it this tick. `DomainSim.step` must skip that link without reading
+it (no ghosts, no events). Every replica sees the same empty payload, and if the confirmed one differs, a
+rollback follows.
+
 ## Handoff and recovery
 
 - **Checks:** confirmed hashes travel as (domain, tick, hash) inside ZINPUT and are compared among replicas. On
