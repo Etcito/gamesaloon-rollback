@@ -194,9 +194,19 @@ export class ZoneSession<TInput> {
   private readonly tuning: ZoneTuning
   private readonly fixedDt: number
   private readonly maxSubsteps: number
+  /**
+   * Most time the accumulator keeps across a stall, in seconds: the prediction window, so a local seat waiting for a
+   * boundary snapshot (two network trips away) catches up after it instead of falling behind for good.
+   */
+  private readonly maxOwed: number
   private readonly maxPrediction: number
   /** Retains a full keyframe interval plus check latency, prediction, delay and assignment lead. */
   private readonly inputCapacity: number
+  /**
+   * Ticks a seat or field domain reads its shadows late: maxDelay, the longest input delay, so each trip of a shadow
+   * pair has maxDelay + 1 ticks to arrive. It changes what a step reads, so every peer must use the same maxDelay.
+   */
+  private readonly shadowLag: number
   private acc = 0
   private tick = 0
   private isStalled = false
@@ -271,6 +281,7 @@ export class ZoneSession<TInput> {
     if (!(Number.isInteger(this.maxSubsteps) && this.maxSubsteps >= 1)) throw new Error('[zones] session: bad maxSubsteps')
     this.maxPrediction = cfg.maxPrediction ?? DEFAULT_MAX_PREDICTION
     this.resendAfterMs = cfg.resendSilenceMs ?? Math.max(DEFAULT_RESEND_SILENCE_TICKS * 1000 / tickRate, DEFAULT_RESEND_SILENCE_MS)
+    this.maxOwed = Math.max(this.maxSubsteps, this.maxPrediction) * this.fixedDt
     const maxDelay = cfg.maxDelay ?? DEFAULT_MAX_DELAY
     validateZoneTuning(cfg.tuning, { maxPrediction: this.maxPrediction, maxDelay })
     if (!(cfg.tuning.snapshotRing > this.maxPrediction)) throw new Error('[zones] session: snapshotRing must exceed maxPrediction')
@@ -294,6 +305,7 @@ export class ZoneSession<TInput> {
     }
     this.others.sort((a, b) => a - b)
     this.inputCapacity = cfg.tuning.epochTicks * cfg.tuning.keyframeEvery + cfg.tuning.snapshotRing + cfg.tuning.leadTicks + this.maxPrediction + maxDelay
+    this.shadowLag = maxDelay
     this.checkCap = Math.min(0xff, Math.ceil(cfg.tuning.snapshotRing / Math.max(1, this.maxPrediction)))
     for (let i = 0; i < this.checkCap; i++) this.checkPool.push({ domain: 0, tick: 0, hash: 0 })
     const minDelay = cfg.minDelay ?? DEFAULT_MIN_DELAY
@@ -405,7 +417,8 @@ export class ZoneSession<TInput> {
       this.acc -= this.fixedDt
     }
     if (this.isStalled) stats.stallFrames++
-    if (this.acc > this.maxSubsteps * this.fixedDt) this.acc = this.maxSubsteps * this.fixedDt
+    // Time owed past maxOwed is dropped: a long wait does not end in a long burst of local ticks.
+    if (this.acc > this.maxOwed) this.acc = this.maxOwed
 
     // Each domain catches up on its own; one waiting for an input stalls alone.
     for (let i = 0; i < this.grace.length; i++) this.advance(this.grace[i])
@@ -423,7 +436,7 @@ export class ZoneSession<TInput> {
     const ring = new DomainRing(this.tuning)
     const slots = this.cfg.roster.seatCount * ring.size
     const inbound = DomainFrontier.inbound(spec, this.current.shadows, this.current.domains)
-    const frontierCfg = { capacity: this.inputCapacity, shadowSlotBytes: 0, neutral: this.codec.neutral >>> 0 }
+    const frontierCfg = { capacity: this.inputCapacity, shadowSlotBytes: 0, neutral: this.codec.neutral >>> 0, shadowLag: this.shadowLag }
     const d: DomainState<TInput> = {
       spec,
       sim,
@@ -461,6 +474,7 @@ export class ZoneSession<TInput> {
       hosts: this.current.seatHost.slice(), drops: new Map(),
       sleepLog: new ShadowOutRing(spec.id, false, [], ring.size, sim.tick - 1),
     }
+    d.inputs.startShadows(d.start)
     let at = this.list.length
     while (at > 0 && this.list[at - 1].spec.id > spec.id) at--
     this.list.splice(at, 0, d)
@@ -1160,8 +1174,9 @@ export class ZoneSession<TInput> {
 
   /**
    * The producer of a domain sends its shadowOut over each explicit link and its events to the global domain. The
-   * payload of tick t is written from the state before step t, like the snapshot and hash of t, so two linked domains
-   * never wait on each other's same tick. The epoch task calls this again when links or producers change.
+   * payload of tick t is written from the state before step t, like the snapshot and hash of t, and a linked seat or
+   * field domain steps with it at t + shadowLag (DomainFrontier), so a pair of linked domains confirms at full rate.
+   * The epoch task calls this again when links or producers change.
    */
   private bindShadowOut(d: DomainState<TInput>): void {
     this.shadowOut.delete(d)
@@ -1301,7 +1316,8 @@ export class ZoneSession<TInput> {
 
   /**
    * Inputs of a state created at S: each seat buffer starts at S-1 with the best prediction held and takes every code
-   * known from S on (local seats from localBufs, the others from the old state that knows most); shadows start at S-1.
+   * known from S on (local seats from localBufs, the others from the old state that knows most). Shadows were started
+   * by addDomain: a payload from before S goes to the old state, so the new one reads nothing for its first lag ticks.
    */
   private seed(n: DomainState<TInput>, old: Map<DomainId, DomainState<TInput>>): void {
     const S = n.start
@@ -1323,7 +1339,6 @@ export class ZoneSession<TInput> {
         if (c !== undefined) buf.set(t, c)
       }
     }
-    for (const sh of n.inputs.shadows) sh.lastTick = S - 1
   }
 
   /** Drops the old states whose grace ended, once final and nothing derives from or still sends them. */

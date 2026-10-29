@@ -96,6 +96,10 @@ reader for that link, meaning nothing from it this tick. `DomainSim.step` must s
 it (no ghosts, no events). Every replica sees the same empty payload, and if the confirmed one differs, a
 rollback follows.
 
+Shadow lag: a seat or field domain steps with a link's payload of tick t at tick `t + maxDelay`, so two domains that
+shadow each other confirm at full rate instead of one tick per network trip. The global domain reads events with
+no lag. A state created at S reads empty payloads for its first `maxDelay` ticks.
+
 ## Handoff and recovery
 
 - **Checks:** confirmed hashes travel as (domain, tick, hash) inside ZINPUT and are compared among replicas. On
