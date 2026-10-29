@@ -3,19 +3,22 @@
 // Tick numbering follows RollbackSession: the snapshot and hash of tick t are those of the state before step t.
 import { InputBuffer } from '../inputBuffer.ts'
 import { MAX_FRAME_DT } from '../rollback.ts'
-import { SnapWriter } from '../snap.ts'
+import { SnapReader, SnapWriter } from '../snap.ts'
 import { CorrectionSmoother } from '../smoothing.ts'
 import { DEFAULT_DELAY_HIDDEN_TICKS, DEFAULT_MAX_DELAY, DEFAULT_MAX_PREDICTION, DEFAULT_MIN_DELAY, DEFAULT_TICK_RATE, DelayController, MAX_PEERS } from '../timing.ts'
 import type { InputCodec, NetChannel, RollbackTuning } from '../types.ts'
-import { MAX_WIRE_PLAYERS, MAX_WIRE_TICKS } from '../wire.ts'
+import { MAX_WIRE_PLAYERS, MAX_WIRE_TICKS, SnapshotAssembler } from '../wire.ts'
+import type { SnapshotMsg } from '../wire.ts'
 import { assign } from './assign.ts'
 import { DomainRing } from './domainRing.ts'
+import { ControlStore, planEpoch } from './epoch.ts'
+import type { DomainTransfer } from './epoch.ts'
 import { DomainFrontier } from './frontier.ts'
 import { validateZoneTuning } from './tuning.ts'
 import type { ZoneTuning } from './tuning.ts'
 import type { Assignment, DomainFactory, DomainId, DomainSim, DomainSpec, GroupTransport, Roster, SeatId } from './types.ts'
 import { decodeZone, ZMSG, ZoneWireWriter } from './wire.ts'
-import type { ZControlMsg, ZInputMsg, ZShadowMsg } from './wire.ts'
+import type { ZControlMsg, ZDomainSnapshotMsg, ZInputMsg, ZShadowMsg } from './wire.ts'
 
 /** Receives the display-only far stream: poses of entities in domains the local peer does not replicate. */
 export interface FarSink {
@@ -81,8 +84,33 @@ export interface DomainState<TInput> {
   readonly decoded: TInput[]
   /** The other replicas: ZINPUT goes to them. */
   readonly peers: number[]
-  /** Per peer, the highest contiguous tick of the local seats it acknowledged for this domain, or -1. */
+  /** Per peer, the highest contiguous tick of the local seats it acknowledged for this domain, or start - 1. */
   readonly peerAck: Int32Array
+  /** First tick this state steps: 0, or the boundary S it was created at. */
+  readonly start: number
+  /** First tick it no longer steps: Infinity, or the boundary that replaced it (it is then kept for the grace). */
+  end: number
+  /** How its state at `start` is derived, while that can still change; else null. */
+  build: DomainBuild<TInput> | null
+}
+
+/** The derivation of a state created at S, run again when a source re-simulates across S. */
+export interface DomainBuild<TInput> {
+  /** Old domains sharing a seat or cell with it, ascending. */
+  readonly sources: DomainId[]
+  /** Local old states read live at S, ascending id; empty when the whole domain arrives by DOMAIN_SNAPSHOT. */
+  readonly srcs: DomainState<TInput>[]
+  /** The only source is the same domain: its snapshot is copied rather than rebuilt. */
+  readonly inPlace: boolean
+  readonly whole: boolean
+  /** DOMAIN_SNAPSHOTs this peer waits for: one whole, or one export per source it lacks. */
+  readonly transfers: DomainTransfer[]
+  /** Received payloads: the whole snapshot at -1, else each source export by source id. */
+  readonly got: Map<number, Uint8Array>
+  /** One assembler per sender: ordered reliable parts, fnv-checked. */
+  readonly asm: Map<number, SnapshotAssembler>
+  /** The derivation must run (again) at the next step of `start`. */
+  dirty: boolean
 }
 
 /**
@@ -114,7 +142,20 @@ export class ZoneSession<TInput> {
   private readonly localCodes: Uint32Array
   private readonly localControls: Uint32Array
   /** Control words of every seat by tick: the assignment of epoch E reads the confirmed ones at E*K-L. */
-  private readonly controlBufs: InputBuffer[] = []
+  private readonly controls: ControlStore
+  /** Codes of each local seat by tick: they seed the domains a boundary creates. */
+  private readonly localBufs: InputBuffer[] = []
+  /** The first epoch not planned yet, and its boundary: no state steps that tick before the plan. */
+  private nextEpoch = 1
+  private limit: number
+  private prevAssign: Assignment | null = null
+  /** Old states kept after a boundary until graceUntil: they step to their end and keep answering. */
+  private readonly grace: DomainState<TInput>[] = []
+  /** DOMAIN_SNAPSHOTs this peer sends at S, once what they carry is final. */
+  private readonly owed: { t: DomainTransfer; x: DomainState<TInput>; whole: boolean }[] = []
+  /** Reliable messages for a boundary not planned yet; replayed after the plan. */
+  private early: { peer: number; ch: NetChannel; data: Uint8Array }[] = []
+  private readonly buildW = new SnapWriter()
   private readonly delayCtl: DelayController
   private readonly writer = new ZoneWireWriter()
   private readonly inbox: { peer: number; ch: NetChannel; data: Uint8Array }[] = []
@@ -135,8 +176,8 @@ export class ZoneSession<TInput> {
   }
   /** Buffer index in DomainFrontier of each seat in zinOut.seatIds. */
   private readonly zinIdx = new Int32Array(MAX_WIRE_PLAYERS)
-  /** Outbound shadow and event links of the domains the local peer produces, by source domain. */
-  private readonly shadowOut = new Map<DomainId, ShadowOutRing[]>()
+  /** Outbound shadow and event links of the domains the local peer produces, by state (an old and a new one can share an id). */
+  private readonly shadowOut = new Map<DomainState<TInput>, ShadowOutRing[]>()
   private readonly shadowW = new SnapWriter()
   private readonly shadowPayloads: Uint8Array[] = []
 
@@ -178,7 +219,11 @@ export class ZoneSession<TInput> {
     for (let i = 0; i < n; i++) this.localIn.push(cfg.codec.create())
     this.localCodes = new Uint32Array(n)
     this.localControls = new Uint32Array(n)
-    for (let s = 0; s < roster.seatCount; s++) this.controlBufs.push(new InputBuffer(cfg.controls[s], this.inputCapacity))
+    this.controls = new ControlStore(roster.seatCount, cfg.tuning)
+    // A seat no live peer drives sends no control words; its sample falls back to the latest word or an observer.
+    for (let s = 0; s < roster.seatCount; s++) if (this.seatOwner[s] < 0 || !roster.live[this.seatOwner[s]]) this.controls.expect(s, false)
+    for (let i = 0; i < n; i++) this.localBufs.push(new InputBuffer(cfg.codec.neutral, this.inputCapacity))
+    this.limit = cfg.tuning.epochTicks
     this.stats = {
       tick: 0, confirmedTick: {}, delay: this.delayCtl.current, frames: 0, rollbacks: 0, maxRollback: 0, resimTicks: 0,
       stallFrames: 0, desyncs: 0, malformed: 0, lostPeers: [],
@@ -193,8 +238,10 @@ export class ZoneSession<TInput> {
 
     // Ticks 0..delay-1 of the local seats: neutral inputs and the epoch 0 control words.
     for (let t = 0; t < this.delayCtl.current; t++) {
-      for (const seat of this.localSeats) {
-        this.controlBufs[seat].set(t, cfg.controls[seat])
+      for (let i = 0; i < n; i++) {
+        const seat = this.localSeats[i]
+        this.controls.set(seat, t, cfg.controls[seat])
+        this.localBufs[i].set(t, cfg.codec.neutral)
         this.storeLocalSeat(seat, t, cfg.codec.neutral >>> 0)
       }
     }
@@ -215,7 +262,7 @@ export class ZoneSession<TInput> {
 
   /** The local confirmed hash of a domain at a tick still in its hash ring, or undefined. */
   confirmedHash(domain: DomainId, tick: number): number | undefined {
-    const d = this.byId.get(domain)
+    const d = this.stateFor(domain, tick)
     return d ? d.ring.hashAt(tick) : undefined
   }
 
@@ -230,11 +277,14 @@ export class ZoneSession<TInput> {
     const now = this.net.now()
     this.receive(now)
     this.recover(now)
+    // Old states first: one that re-simulates marks what was derived from it at S.
+    for (let i = 0; i < this.grace.length; i++) this.rollback(this.grace[i])
     const list = this.list
     for (let i = 0; i < list.length; i++) {
       if (list[i].smoother) list[i].smoother!.decay(dt)
       this.rollback(list[i])
     }
+    this.plan()
 
     const delay = this.updateDelay(now)
     this.acc += dt
@@ -255,22 +305,18 @@ export class ZoneSession<TInput> {
     if (this.acc > this.maxSubsteps * this.fixedDt) this.acc = this.maxSubsteps * this.fixedDt
 
     // Each domain catches up on its own; one waiting for an input stalls alone.
-    for (let i = 0; i < list.length; i++) {
-      const d = list[i]
-      for (let k = 0; k < this.maxSubsteps && d.sim.tick < this.tick && d.inputs.canStep(d.sim.tick, this.maxPrediction); k++) {
-        this.simulate(d, d.sim.tick)
-      }
-      this.confirm(d)
-    }
+    for (let i = 0; i < this.grace.length; i++) this.advance(this.grace[i])
+    for (let i = 0; i < list.length; i++) this.advance(list[i])
     this.send(now)
+    this.dropGrace()
     stats.tick = this.tick
     stats.delay = delay
     const a = this.acc / this.fixedDt
     return a > 0 ? (a < 1 ? a : 1) : 0
   }
 
-  /** Adds a domain replicated here in ascending id order; the epoch task adds rebuilt and joined ones too. */
-  private addDomain(spec: DomainSpec, sim: DomainSim<TInput>): DomainState<TInput> {
+  /** Adds a domain replicated here in ascending id order, starting at sim.tick: epoch 0, or a boundary. */
+  private addDomain(spec: DomainSpec, sim: DomainSim<TInput>, build: DomainBuild<TInput> | null = null): DomainState<TInput> {
     const ring = new DomainRing(this.tuning)
     const slots = this.cfg.roster.seatCount * ring.size
     const inbound = DomainFrontier.inbound(spec, this.current.shadows, this.current.domains)
@@ -291,7 +337,10 @@ export class ZoneSession<TInput> {
       usedTick: new Int32Array(slots).fill(-1),
       decoded: [],
       peers: spec.replicas.filter((p) => p !== this.cfg.localPeer),
-      peerAck: new Int32Array(MAX_PEERS).fill(-1),
+      peerAck: new Int32Array(MAX_PEERS).fill(sim.tick - 1),
+      start: sim.tick,
+      end: Infinity,
+      build,
     }
     let at = this.list.length
     while (at > 0 && this.list[at - 1].spec.id > spec.id) at--
@@ -305,9 +354,14 @@ export class ZoneSession<TInput> {
   /** Maps each local seat to its seat domain; run again whenever the assignment changes. */
   private bindLocal(): void {
     this.localDomain.length = 0
+    const prev = this.prevAssign
+    const s = this.current.epoch * this.tuning.epochTicks
     for (const seat of this.localSeats) {
       const id = this.current.seatDomain[seat]
       this.localDomain.push(id >= 0 ? (this.byId.get(id) ?? null) : null)
+      // Until S the seat still runs in its old seat domain, kept for the grace.
+      const pid = prev ? prev.seatDomain[seat] : -1
+      for (const g of this.grace) if (g.spec.id === pid && g.end === s) this.localDomain.push(g)
     }
   }
 
@@ -315,21 +369,54 @@ export class ZoneSession<TInput> {
   private localStalled(): boolean {
     const doms = this.localDomain
     for (let i = 0; i < doms.length; i++) {
-      if (doms[i] && !doms[i]!.inputs.canStep(this.tick, this.maxPrediction)) return true
+      const d = doms[i]
+      if (d && this.tick < d.end && !this.canStep(d, this.tick)) return true
     }
     return false
   }
 
   /**
-   * Runs tick t of one domain: the snapshot and hash of t, the epoch boundary (after the snapshot, so a rollback to t
-   * replays it), the known or predicted code of every member seat (recorded as used), then the step.
+   * Whether a state may step tick t: inside its ticks, before the next unplanned boundary, within prediction of its
+   * frontier. A pending build steps S once every local source reached S and every payload arrived, then stays within
+   * maxPrediction of S, so a re-derive at S is still in the ring.
+   */
+  private canStep(d: DomainState<TInput>, t: number): boolean {
+    if (t >= d.end || t >= this.limit || !d.inputs.canStep(t, this.maxPrediction)) return false
+    const b = d.build
+    if (b === null) return true
+    if (t !== d.start) return t - d.start < this.maxPrediction
+    if (b.got.size < b.transfers.length) return false
+    for (let i = 0; i < b.srcs.length; i++) if (b.srcs[i].sim.tick < b.srcs[i].end) return false
+    return true
+  }
+
+  /** Steps one state toward the session tick, releases its build once nothing it read can change, and confirms. */
+  private advance(d: DomainState<TInput>): void {
+    for (let k = 0; k < this.maxSubsteps && d.sim.tick < this.tick && this.canStep(d, d.sim.tick); k++) this.simulate(d, d.sim.tick)
+    const b = d.build
+    if (b !== null && !b.dirty && d.sim.tick > d.start && b.got.size >= b.transfers.length) {
+      let done = true
+      for (let i = 0; i < b.srcs.length; i++) if (!this.final(b.srcs[i])) done = false
+      if (done) d.build = null
+    }
+    this.confirm(d)
+  }
+
+  /** An old state at its end, with every input known and nothing left to re-simulate: it no longer changes. */
+  private final(x: DomainState<TInput>): boolean {
+    return x.sim.tick >= x.end && x.build === null && x.rollbackTick === Infinity && x.inputs.frontier() >= x.end - 1
+  }
+
+  /**
+   * Runs tick t of one domain: a pending boundary derivation (before the snapshot, so the snapshot of S holds it), the
+   * snapshot and hash of t, the known or predicted code of every member seat (recorded as used), then the step.
    */
   private simulate(d: DomainState<TInput>, t: number): void {
+    if (t === d.start && d.build !== null && d.build.dirty) this.epochStep(d, t)
     const size = d.ring.size
     const slot = t % size
     d.ring.save(d.sim, t)
     d.hashes[slot] = d.sim.hash() >>> 0
-    if (t > 0 && t % this.tuning.epochTicks === 0) this.epochStep(d, t)
     const bufs = d.inputs.buffers
     const seats = d.inputs.seats
     const decoded = d.decoded
@@ -368,6 +455,7 @@ export class ZoneSession<TInput> {
       if (sim.endResim) sim.endResim()
     }
     if (view && d.smoother) d.smoother.settle(view)
+    if (d.end !== Infinity) this.invalidate(d)
     const depth = present - rb
     this.stats.rollbacks++
     if (depth > this.stats.maxRollback) this.stats.maxRollback = depth
@@ -379,13 +467,63 @@ export class ZoneSession<TInput> {
     let c = d.inputs.frontier() + 1
     if (c > d.sim.tick - 1) c = d.sim.tick - 1
     if (c > d.rollbackTick) c = d.rollbackTick
+    // Tick S of a new state is not confirmed while its build can still change.
+    if (d.build !== null && c > d.start - 1) c = d.start - 1
     let t = d.confirmed + 1
     if (t < c - d.ring.size + 1) t = c - d.ring.size + 1
     for (; t <= c; t++) if (d.ring.has(t)) d.ring.recordHash(t, d.hashes[t % d.ring.size])
     if (c > d.confirmed) {
       d.confirmed = c
-      this.stats.confirmedTick[d.spec.id] = c
+      if (d.end === Infinity) this.stats.confirmedTick[d.spec.id] = c
     }
+  }
+
+  /** A source re-simulated: whatever was derived from it derives again, by a rollback to S once it stepped S. */
+  private invalidate(x: DomainState<TInput>): void {
+    const n = this.list.length
+    for (let i = 0; i < n + this.grace.length; i++) {
+      const d = i < n ? this.list[i] : this.grace[i - n]
+      if (d.build === null || d.build.srcs.indexOf(x) < 0) continue
+      d.build.dirty = true
+      if (d.sim.tick > d.start && d.start < d.rollbackTick) d.rollbackTick = d.start
+    }
+  }
+
+  /**
+   * The boundary of a state created at S, run at its step S and again after a source re-simulated: a whole
+   * DOMAIN_SNAPSHOT is restored; a domain kept in place copies its old state; else factory.rebuild merges the exports
+   * of every source, ascending id (local ones read live at S, the others received). The result is restored into the
+   * running sim, so a rollback in progress keeps its object.
+   */
+  private epochStep(d: DomainState<TInput>, t: number): void {
+    const b = d.build!
+    b.dirty = false
+    const w = this.buildW
+    let bytes = b.got.get(-1)
+    if (!bytes && b.inPlace) {
+      w.reset()
+      b.srcs[0].sim.snapshot(w)
+      bytes = w.bytes()
+    } else if (!bytes) {
+      const readers: SnapReader[] = []
+      for (const id of b.sources) {
+        const src = b.srcs.find((x) => x.spec.id === id)
+        const got = b.got.get(id)
+        if (src) {
+          const ew = new SnapWriter()
+          src.sim.exportEntities(ew)
+          readers.push(new SnapReader(ew.bytes()))
+        } else if (got) {
+          readers.push(new SnapReader(got))
+        }
+      }
+      w.reset()
+      this.cfg.factory.rebuild(d.spec, t, readers).snapshot(w)
+      bytes = w.bytes()
+    }
+    d.sim.restore(new SnapReader(bytes))
+    d.sim.tick = t
+    this.captureShadows(d, t)
   }
 
   /**
@@ -396,19 +534,21 @@ export class ZoneSession<TInput> {
     const seats = this.localSeats
     if (seats.length === 0) return
     for (let i = 0; i < seats.length; i++) this.localCodes[i] = this.codec.encode(this.localIn[i]) >>> 0
-    let next = this.controlBufs[seats[0]].lastTick + 1
+    let next = this.localBufs[0].lastTick + 1
     if (next < tick) next = tick
     for (let t = next; t <= tick + delay; t++) {
       for (let i = 0; i < seats.length; i++) {
-        this.controlBufs[seats[i]].set(t, this.localControls[i])
+        this.controls.set(seats[i], t, this.localControls[i])
+        this.localBufs[i].set(t, this.localCodes[i])
         this.storeLocalSeat(seats[i], t, this.localCodes[i])
       }
     }
   }
 
-  /** A local code goes to every replicated domain listing the seat: its seat domain and the global domain. */
+  /** A local code goes to every state listing the seat that holds tick t: its seat domain and the global domain. */
   private storeLocalSeat(seat: SeatId, t: number, code: number): void {
-    for (let i = 0; i < this.list.length; i++) this.storeSeat(this.list[i], seat, t, code)
+    for (let i = 0; i < this.list.length; i++) if (t >= this.list[i].start) this.storeSeat(this.list[i], seat, t, code)
+    for (let i = 0; i < this.grace.length; i++) if (t < this.grace[i].end) this.storeSeat(this.grace[i], seat, t, code)
   }
 
   /**
@@ -436,14 +576,22 @@ export class ZoneSession<TInput> {
 
   /** Drains the transport and routes each message to what it names; messages for unreplicated domains are dropped. */
   private receive(_now: number): void {
-    const inbox = this.inbox
-    this.net.drain(inbox)
+    this.net.drain(this.inbox)
+    this.dispatch(this.inbox)
+  }
+
+  private dispatch(inbox: { peer: number; ch: NetChannel; data: Uint8Array }[]): void {
     for (let i = 0; i < inbox.length; i++) {
       const e = inbox[i]
       const m = decodeZone(e.data)
       const from = e.peer
       if (!m || m.from !== from || from === this.cfg.localPeer || this.isPeer[from] !== 1) {
         this.stats.malformed++
+        continue
+      }
+      // SHADOW and DOMAIN_SNAPSHOT arrive once: one reaching past a boundary not planned here yet waits for the plan.
+      if ((m.type === ZMSG.SHADOW && m.firstTick + m.count > this.limit) || (m.type === ZMSG.DOMAIN_SNAPSHOT && m.tick >= this.limit)) {
+        this.early.push({ peer: from, ch: e.ch, data: e.data.slice() })
         continue
       }
       switch (m.type) {
@@ -455,6 +603,9 @@ export class ZoneSession<TInput> {
           break
         case ZMSG.SHADOW:
           this.onShadow(m)
+          break
+        case ZMSG.DOMAIN_SNAPSHOT:
+          this.onSnapshot(m)
           break
         default:
           break
@@ -475,8 +626,19 @@ export class ZoneSession<TInput> {
       return
     }
     for (let t = 0; t < m.count; t++) {
-      for (let j = 0; j < n; j++) this.controlBufs[m.seatIds[j]].set(m.firstTick + t, m.words[t * n + j])
+      for (let j = 0; j < n; j++) this.controls.set(m.seatIds[j], m.firstTick + t, m.words[t * n + j])
     }
+  }
+
+  /** The state of a domain id that holds tick t: the current one from its start, else an old one kept for the grace. */
+  private stateFor(id: DomainId, t: number): DomainState<TInput> | undefined {
+    const d = this.byId.get(id)
+    if (d && t >= d.start) return d
+    for (let i = 0; i < this.grace.length; i++) {
+      const g = this.grace[i]
+      if (g.spec.id === id && t >= g.start && t < g.end) return g
+    }
+    return undefined
   }
 
   private onInput(m: ZInputMsg): void {
@@ -485,7 +647,8 @@ export class ZoneSession<TInput> {
       this.stats.malformed++
       return
     }
-    const d = this.byId.get(m.domain)
+    // A window past a boundary not planned here comes from a state not built yet; it is sent again until acked.
+    const d = m.firstTick < this.limit ? this.stateFor(m.domain, m.firstTick) : undefined
     if (!d) return
     if (m.ackTick > d.peerAck[m.from]) d.peerAck[m.from] = m.ackTick
     // storeSeat schedules the domain's rollback from the earliest tick that ran with another code.
@@ -499,9 +662,30 @@ export class ZoneSession<TInput> {
       this.stats.malformed++
       return
     }
-    const d = this.byId.get(m.toDomain)
-    if (!d) return
-    for (let i = 0; i < m.count; i++) this.storeShadow(d, m.fromDomain, m.firstTick + i, m.payloads[i])
+    for (let i = 0; i < m.count; i++) {
+      const d = this.stateFor(m.toDomain, m.firstTick + i)
+      if (d) this.storeShadow(d, m.fromDomain, m.firstTick + i, m.payloads[i])
+    }
+  }
+
+  /** Reassembles a DOMAIN_SNAPSHOT for a state waiting at S; a source export starts with its u16 source id. */
+  private onSnapshot(m: ZDomainSnapshotMsg): void {
+    const n = this.byId.get(m.domain)
+    if (!n || n.build === null || n.start !== m.tick) return
+    const b = n.build
+    const asm = b.asm.get(m.from)
+    // push() reads only the part fields, which the zone message shares with SnapshotMsg.
+    const done = asm ? asm.push(m as unknown as SnapshotMsg) : null
+    if (!done) return
+    if (b.whole) {
+      b.got.set(-1, done.bytes)
+      return
+    }
+    const src = done.bytes.length >= 2 ? done.bytes[0] | (done.bytes[1] << 8) : -1
+    let ok = false
+    for (const t of b.transfers) if (t.source === src && t.sender === m.from) ok = true
+    if (ok) b.got.set(src, done.bytes.subarray(2))
+    else this.stats.malformed++
   }
 
   private storeShadow(d: DomainState<TInput>, from: DomainId, t: number, data: Uint8Array): void {
@@ -511,12 +695,38 @@ export class ZoneSession<TInput> {
 
   private send(_now: number): void {
     this.sendControl()
-    const list = this.list
-    for (let i = 0; i < list.length; i++) {
-      const d = list[i]
+    const n = this.list.length
+    for (let i = 0; i < n + this.grace.length; i++) {
+      const d = i < n ? this.list[i] : this.grace[i - n]
       this.sendInputs(d)
-      const links = this.shadowOut.get(d.spec.id)
+      const links = this.shadowOut.get(d)
       if (links) for (let k = 0; k < links.length; k++) this.sendShadow(d, links[k])
+    }
+    this.sendOwed()
+  }
+
+  /**
+   * The DOMAIN_SNAPSHOTs of S, in SNAPSHOT_CHUNK parts on the reliable channel: a whole domain once its build is
+   * released (its snapshot of S is final), a source export (u16 source id first) once that old source is final.
+   */
+  private sendOwed(): void {
+    for (let i = this.owed.length - 1; i >= 0; i--) {
+      const { t, x, whole } = this.owed[i]
+      if (whole ? x.build !== null || x.sim.tick <= x.start : !this.final(x)) continue
+      this.owed.splice(i, 1)
+      let bytes: Uint8Array | null
+      if (whole) {
+        bytes = x.ring.bytesAt(x.start)
+      } else {
+        const w = this.buildW
+        w.reset()
+        w.u16(t.source)
+        x.sim.exportEntities(w)
+        bytes = w.bytes()
+      }
+      if (!bytes) continue
+      const parts = this.writer.domainSnapshotParts(this.cfg.localPeer, t.domain, whole ? x.start : x.end, bytes)
+      for (let k = 0; k < parts.length; k++) this.fanOut(t.targets, 'reliable', parts[k])
     }
   }
 
@@ -535,7 +745,7 @@ export class ZoneSession<TInput> {
     const seats = this.localSeats
     const ns = seats.length < MAX_WIRE_PLAYERS ? seats.length : MAX_WIRE_PLAYERS
     if (ns === 0 || this.others.length === 0) return
-    const last = this.controlBufs[seats[0]].lastTick
+    const last = this.localBufs[0].lastTick
     const m = this.ctlOut
     m.from = this.cfg.localPeer
     m.seats = ns
@@ -545,7 +755,7 @@ export class ZoneSession<TInput> {
       let count = last - first + 1
       if (count > MAX_WIRE_TICKS) count = MAX_WIRE_TICKS
       for (let t = 0; t < count; t++) {
-        for (let j = 0; j < ns; j++) m.words[t * ns + j] = this.controlBufs[seats[j]].predict(first + t)
+        for (let j = 0; j < ns; j++) m.words[t * ns + j] = this.controls.get(seats[j], first + t) >>> 0
       }
       m.firstTick = first
       m.count = count
@@ -576,13 +786,16 @@ export class ZoneSession<TInput> {
         this.zinIdx[nk++] = i
       }
     }
-    const localLast = nk > 0 ? bufs[this.zinIdx[0]].lastTick : d.sim.tick
-    if (localLast < 0) return
+    let localLast = nk > 0 ? bufs[this.zinIdx[0]].lastTick : d.sim.tick
+    // A state answers for its own ticks only, never past an unplanned boundary, so receivers route by firstTick.
+    const end = d.end < this.limit ? d.end : this.limit
+    if (localLast > end - 1) localLast = end - 1
+    if (localLast < d.start) return
     let first = Infinity
     for (let i = 0; i < peers.length; i++) if (d.peerAck[peers[i]] + 1 < first) first = d.peerAck[peers[i]] + 1
     if (first > localLast) first = localLast
     if (first <= localLast - this.inputCapacity) first = localLast - MAX_WIRE_TICKS + 1
-    if (first < 0) first = 0
+    if (first < d.start) first = d.start
     let count = localLast - first + 1
     if (count > MAX_WIRE_TICKS) count = MAX_WIRE_TICKS
     for (let t = 0; t < count; t++) {
@@ -608,7 +821,6 @@ export class ZoneSession<TInput> {
   private sendShadow(d: DomainState<TInput>, link: ShadowOutRing): void {
     const last = d.confirmed
     const out = this.shadowPayloads
-    const target = this.byId.get(link.to)
     while (link.sent < last) {
       const first = link.sent + 1
       let count = last - first + 1
@@ -616,6 +828,7 @@ export class ZoneSession<TInput> {
       out.length = count
       for (let i = 0; i < count; i++) {
         out[i] = link.payload(first + i)
+        const target = this.stateFor(link.to, first + i)
         if (target) this.storeShadow(target, d.spec.id, first + i, out[i])
       }
       const data = this.writer.shadow(this.cfg.localPeer, d.spec.id, link.to, first, out)
@@ -631,7 +844,7 @@ export class ZoneSession<TInput> {
    * never wait on each other's same tick. The epoch task calls this again when links or producers change.
    */
   private bindShadowOut(d: DomainState<TInput>): void {
-    this.shadowOut.delete(d.spec.id)
+    this.shadowOut.delete(d)
     if (!d.producer) return
     const local = this.cfg.localPeer
     const domains = this.current.domains
@@ -646,13 +859,13 @@ export class ZoneSession<TInput> {
       links.push(new ShadowOutRing(global.id, true, global.replicas.filter((p) => p !== local), this.inputCapacity, d.sim.tick - 1))
     }
     if (links.length === 0) return
-    this.shadowOut.set(d.spec.id, links)
+    this.shadowOut.set(d, links)
     this.captureShadows(d, d.sim.tick)
   }
 
   /** Writes the outbound payloads of tick `tick` from the domain's current state; a resimulation rewrites them. */
   private captureShadows(d: DomainState<TInput>, tick: number): void {
-    const links = this.shadowOut.get(d.spec.id)
+    const links = this.shadowOut.get(d)
     if (!links) return
     const w = this.shadowW
     for (let i = 0; i < links.length; i++) {
@@ -667,15 +880,161 @@ export class ZoneSession<TInput> {
     this.captureShadows(d, t + 1)
   }
 
+  // ---- Epoch boundary S = E*K. Once the control sample of S-L is confirmed, assign() and planEpoch decide the
+  // domains of epoch E. A domain continues (same state) only when nothing it depends on changes; every other local
+  // domain of E is a new state starting at S, whose build epochStep runs at its step S; the old states become grace.
+
+  /** Plans the next boundary when its control sample is confirmed; until then no state steps it. */
+  private plan(): void {
+    const E = this.nextEpoch
+    if (!this.controls.ready(E)) return
+    const prev = this.current
+    const next = assign(this.cfg.roster, this.controls.sample(E), prev, this.tuning)
+    const local = this.cfg.localPeer
+    const plan = planEpoch(prev, next, local, this.tuning)
+    const S = plan.tick
+    const cont = continuedSet(prev, next)
+    const old = new Map(this.byId)
+    let k = 0
+    for (const d of this.list) {
+      if (cont.has(d.spec.id)) {
+        this.list[k++] = d
+        continue
+      }
+      this.byId.delete(d.spec.id)
+      d.end = S
+      d.replica = false
+      d.graceUntil = plan.dropTick
+      this.grace.push(d)
+    }
+    this.list.length = k
+    this.prevAssign = prev
+    this.current = next
+    const prevById = new Map(prev.domains.map((s) => [s.id, s]))
+    for (const spec of next.domains) {
+      if (spec.replicas.indexOf(local) < 0) continue
+      if (cont.has(spec.id)) {
+        this.byId.get(spec.id)!.spec = spec
+        continue
+      }
+      const r = plan.rebuild.find((x) => x.domain === spec.id)
+      const rc = plan.receive.find((x) => x.domain === spec.id)
+      let build: DomainBuild<TInput> | null = null
+      // Neither rebuilt, received nor created: unchanged in planEpoch but not continued here, so copied in place.
+      if (r || rc || plan.create.indexOf(spec.id) < 0) {
+        const sources = r ? r.sources : rc ? rc.sources : [spec.id]
+        const transfers = rc ? rc.transfers : []
+        // epoch.ts marks a whole transfer by source === domain, which a source export can match too: whole means
+        // some new replica held every source.
+        const whole = rc !== undefined && spec.replicas.some((p) => sources.every((s) => prevById.get(s)!.replicas.includes(p)))
+        const srcs: DomainState<TInput>[] = []
+        if (!whole) for (const s of sources) if (old.has(s)) srcs.push(old.get(s)!)
+        build = { sources, srcs, inPlace: r ? r.inPlace : !rc, whole, transfers, got: new Map(), asm: new Map(), dirty: true }
+        for (const t of transfers) if (!build.asm.has(t.sender)) build.asm.set(t.sender, new SnapshotAssembler())
+      }
+      this.seed(this.addDomain(spec, this.cfg.factory.create(spec, S), build), old)
+    }
+    for (const t of plan.send) {
+      // A whole sender rebuilds the domain itself; a source sender sends the export of its old state.
+      const whole = plan.rebuild.some((x) => x.domain === t.domain)
+      const x = whole ? this.byId.get(t.domain) : old.get(t.source)
+      if (x) this.owed.push({ t, x, whole })
+    }
+    this.nextEpoch = E + 1
+    this.limit = this.nextEpoch * this.tuning.epochTicks
+    this.bindLocal()
+    const early = this.early
+    this.early = []
+    this.dispatch(early)
+  }
+
+  /**
+   * Inputs of a state created at S: each seat buffer starts at S-1 with the best prediction held and takes every code
+   * known from S on (local seats from localBufs, the others from the old state that knows most); shadows start at S-1.
+   */
+  private seed(n: DomainState<TInput>, old: Map<DomainId, DomainState<TInput>>): void {
+    const S = n.start
+    const seats = n.inputs.seats
+    for (let i = 0; i < seats.length; i++) {
+      const li = this.localSeats.indexOf(seats[i])
+      let from: InputBuffer | null = li >= 0 ? this.localBufs[li] : null
+      if (from === null) {
+        for (const d of old.values()) {
+          const j = d.inputs.seats.indexOf(seats[i])
+          if (j >= 0 && (from === null || d.inputs.buffers[j].lastTick > from.lastTick)) from = d.inputs.buffers[j]
+        }
+      }
+      const buf = n.inputs.buffers[i]
+      buf.lastTick = S - 2
+      buf.set(S - 1, from ? from.predict(S - 1) : this.codec.neutral)
+      for (let t = S; from && t < S + this.inputCapacity; t++) {
+        const c = from.get(t)
+        if (c !== undefined) buf.set(t, c)
+      }
+    }
+    for (const sh of n.inputs.shadows) sh.lastTick = S - 1
+  }
+
+  /** Drops the old states whose grace ended, once final and nothing derives from or still sends them. */
+  private dropGrace(): void {
+    for (let i = this.grace.length - 1; i >= 0; i--) {
+      const x = this.grace[i]
+      if (this.tick < x.graceUntil || !this.final(x) || this.held(x)) continue
+      this.grace.splice(i, 1)
+      this.shadowOut.delete(x)
+      if (!this.byId.has(x.spec.id)) delete this.stats.confirmedTick[x.spec.id]
+    }
+  }
+
+  private held(x: DomainState<TInput>): boolean {
+    for (let i = 0; i < this.owed.length; i++) if (this.owed[i].x === x) return true
+    const n = this.list.length
+    for (let i = 0; i < n + this.grace.length; i++) {
+      const d = i < n ? this.list[i] : this.grace[i - n]
+      if (d.build !== null && d.build.srcs.indexOf(x) >= 0) return true
+    }
+    return false
+  }
+
   // ---- Hooks the next session tasks fill. Networking: the delay from the replicas' RTT and the piggybacked
-  // confirmed hashes. Epoch: apply assign() over the confirmed controls of S-L at S = E*K. Recovery: lost peers,
-  // ZDROP agreement, hash comparison and cost-class responses. Far: FAR from the producer.
+  // confirmed hashes. Recovery: lost peers, ZDROP agreement, hash comparison and cost-class responses. Far: FAR from
+  // the producer.
   private updateDelay(_now: number): number {
     return this.delayCtl.current
   }
-  private epochStep(_d: DomainState<TInput>, _t: number): void {}
   private recover(_now: number): void {}
   private farOut(_d: DomainState<TInput>, _t: number): void {}
+}
+
+/**
+ * Domain ids whose state runs on across a boundary: same seats, cells, ordered replicas and links, and not a source
+ * of a new domain (a source is read at S, so it cannot step past S). Global, so every replica decides alike.
+ */
+function continuedSet(prev: Assignment, next: Assignment): Set<DomainId> {
+  const out = new Set<DomainId>()
+  for (const s of next.domains) if (prev.domains.some((o) => o.id === s.id) && wiring(prev, s.id) === wiring(next, s.id)) out.add(s.id)
+  for (let changed = true; changed;) {
+    changed = false
+    for (const s of next.domains) {
+      if (out.has(s.id) || s.kind === 'global') continue
+      for (const o of prev.domains) {
+        if (o.kind === 'global' || !out.has(o.id)) continue
+        if (s.seats.some((x) => o.seats.includes(x)) || s.cells.some((c) => o.cells.includes(c))) {
+          out.delete(o.id)
+          changed = true
+        }
+      }
+    }
+  }
+  return out
+}
+
+/** What a domain's state and messages depend on: seats, cells, replicas, inbound sources, links out and the global. */
+function wiring(a: Assignment, id: DomainId): string {
+  const s = a.domains.find((x) => x.id === id)!
+  const out = a.shadows.filter((l) => l.from === id).map((l) => [l.to, a.domains.find((x) => x.id === l.to)?.replicas])
+  const g = a.domains.find((x) => x.kind === 'global')
+  return JSON.stringify([s.seats, s.cells, s.replicas, DomainFrontier.inbound(s, a.shadows, a.domains), out, g ? [g.id, g.replicas] : null])
 }
 
 const EMPTY_BYTES = new Uint8Array(0)
