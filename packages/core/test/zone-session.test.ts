@@ -13,7 +13,7 @@ const factory: ZoneScenario['factory'] = {
   stopBelow: 4, sleepTicks: 3, shadowMargin: 1, goalY: 4000, maxGhosts: 16, maxEvents: 8, eventKinds: 1,
 }
 
-/** (domain, tick) samples confirmed by two peers or more: proof that hashes were actually compared. */
+/** Count shared confirmed samples so an empty comparison cannot pass. */
 function sharedSamples(ctx: ZoneCtx): number {
   let shared = 0
   for (let a = 0; a < ctx.confirmed.length; a++) {
@@ -28,7 +28,7 @@ function sharedSamples(ctx: ZoneCtx): number {
 }
 
 test('zone replicas agree on every shared per-domain confirmed hash, 2 to 8 peers', () => {
-  for (const peers of [2, 3, 5, 8]) {
+  for (let peers = 2; peers <= 8; peers++) {
     const sc: ZoneScenario = { peers, seed: peers, frames: 240, settle: 120, factory, link: { rttMs: 40, jitterMs: 8 } }
     const ctx = zoneSetup(sc)
     assert.deepEqual(zoneRun(sc, ctx), [], `${peers} peers`)
@@ -114,10 +114,15 @@ test('zone SLEEP and WAKE reach each non-replica once, with the pose the produce
         let sim = d.sim as ZonePointSim
         if (sim.tick !== tick + 1) {
           sim = ctx.factories[p].create(d.spec, 0)
-          sim.restore(new SnapReader(d.ring.bytesAt(tick + 1)!))
+          const snapshot = d.ring.bytesAt(tick + 1)
+          assert.ok(snapshot, `producer retains transition tick ${tick + 1}`)
+          sim.restore(new SnapReader(snapshot))
         }
         w.reset()
-        if (asleep) assert.ok(sim.sleepPose(id, w), 'the producer holds the sleeper')
+        if (asleep) {
+          assert.ok(sim.sleepPose(id, w), 'the producer holds the sleeper')
+          assert.equal(w.bytes().length, 8, 'sleep pose contains x and y i32')
+        }
         expected.set(key, { producer: p, replicas: d.spec.replicas.slice(), asleep, pose: w.bytes().slice() })
       },
     }
@@ -130,6 +135,7 @@ test('zone SLEEP and WAKE reach each non-replica once, with the pose the produce
       for (const pkt of out) {
         const m = decodeZone(pkt.data)
         if (!m || (m.type !== ZMSG.SLEEP && m.type !== ZMSG.WAKE)) continue
+        assert.equal(pkt.ch, 'reliable', 'sleep transitions use reliable delivery')
         const key = `${m.domain}:${m.id}:${m.tick}:${m.type === ZMSG.SLEEP}`
         const got = wire[p].get(key)
         if (got) got.n++
