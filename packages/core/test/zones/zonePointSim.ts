@@ -329,6 +329,7 @@ export class ZonePointSim implements DomainSim<PointInput> {
     let g = 0
     for (let s = 0; s < shadows.count; s++) {
       const rd = shadows.reader(s)
+      if (rd.remaining === 0) continue
       const m = rd.u16()
       for (let k = 0; k < m; k++) {
         rd.u32()
@@ -373,6 +374,7 @@ export class ZonePointSim implements DomainSim<PointInput> {
   private stepGlobal(shadows: ShadowView): void {
     for (let s = 0; s < shadows.count; s++) {
       const rd = shadows.reader(s)
+      if (rd.remaining === 0) continue
       const m = rd.u16()
       for (let k = 0; k < m; k++) {
         const kind = rd.u8()
