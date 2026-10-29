@@ -15,6 +15,10 @@
     "./netsim": {
       "types": "./dist/netsim.d.ts",
       "default": "./dist/netsim.js"
+    },
+    "./zones": {
+      "types": "./dist/zones/index.d.ts",
+      "default": "./dist/zones/index.js"
     }
   },
   "files": [
