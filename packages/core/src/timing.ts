@@ -21,8 +21,8 @@ export const TIME_SYNC_WINDOW = 32
 export const TIME_SYNC_MAX_ADVANTAGE = 2
 /** Minimum ticks between two time-sync skips. */
 export const TIME_SYNC_SKIP_INTERVAL = 30
-/** Highest peer id + 1 (room capacity). Peer ids are one byte on the wire; raise this to grow rooms. */
-export const MAX_PEERS = 8
+/** Highest peer id + 1 (room capacity). Peer ids are one byte on the wire, so this may grow up to 256. */
+export const MAX_PEERS = 64
 
 export interface DelayParams {
   tickRate: number
