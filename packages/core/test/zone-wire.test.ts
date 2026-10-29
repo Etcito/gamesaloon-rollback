@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ZMSG, ZoneWireWriter, decodeZone } from '../src/zones/wire.ts'
 import { MAX_WIRE_TICKS, decode } from '../src/wire.ts'
+import { fnv1a32 } from '../src/snap.ts'
 
 test('zone message types occupy 16 through 24', () => {
   assert.deepEqual(ZMSG, {
@@ -99,7 +100,21 @@ test('garbage and unknown types return null without throwing', () => {
   for (let type = 0; type <= 255; type++) {
     const short = new Uint8Array([type, 63, 255])
     assert.equal(decodeZone(short), null)
-    if (type >= ZMSG.CONTROL && type <= ZMSG.ZDESYNC) continue
+    if (type >= ZMSG.CONTROL && type <= ZMSG.ZDESYNC) {
+      // Every zone message is fuzzed: random bodies may decode or not, but never throw.
+      let seed = type * 2654435761
+      for (let i = 0; i < 500; i++) {
+        seed = (seed * 1103515245 + 12345) >>> 0
+        const frame = new Uint8Array(seed % 300)
+        for (let j = 0; j < frame.length; j++) {
+          seed = (seed * 1103515245 + 12345) >>> 0
+          frame[j] = seed >>> 24
+        }
+        if (frame.length > 0) frame[0] = type
+        assert.doesNotThrow(() => decodeZone(frame))
+      }
+      continue
+    }
     const garbage = new Uint8Array(32).fill(255)
     garbage[0] = type
     assert.equal(decodeZone(garbage), null)
@@ -207,4 +222,65 @@ test('seats = 9 in a hand-built frame is rejected', () => {
   z[12] = 1
   z[13] = 9
   assert.equal(decodeZone(z), null)
+})
+
+test('DOMAIN_SNAPSHOT chunks at SNAPSHOT_CHUNK and round-trips', () => {
+  const w = new ZoneWireWriter()
+  const bytes = new Uint8Array(40000)
+  for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 31) & 0xff
+  const parts = w.domainSnapshotParts(63, 700, -5, bytes)
+  assert.equal(parts.length, 3)
+  const joined: number[] = []
+  for (let i = 0; i < parts.length; i++) {
+    const m = decodeZone(parts[i])
+    assert.ok(m && m.type === ZMSG.DOMAIN_SNAPSHOT)
+    assert.equal(m.from, 63)
+    assert.equal(m.domain, 700)
+    assert.equal(m.tick, -5)
+    assert.equal(m.part, i)
+    assert.equal(m.parts, 3)
+    assert.equal(m.totalLen, 40000)
+    assert.equal(m.hash, fnv1a32(bytes))
+    joined.push(...m.bytes)
+  }
+  assert.deepEqual(Uint8Array.from(joined), bytes)
+  for (let cut = 0; cut < 20; cut++) assert.equal(decodeZone(parts[2].subarray(0, cut)), null)
+  const empty = w.domainSnapshotParts(63, 1, 0, new Uint8Array(0))
+  assert.equal(empty.length, 1)
+  const m = decodeZone(empty[0])
+  assert.ok(m && m.type === ZMSG.DOMAIN_SNAPSHOT)
+  assert.equal(m.bytes.length, 0)
+  assert.equal(m.parts, 1)
+})
+
+test('FAR round-trips and truncated prefixes give null', () => {
+  const w = new ZoneWireWriter()
+  const entries = new Uint8Array(24).map((_, i) => i + 1)
+  const frame = w.far(63, 0xfffe, 1234, 15, 3, entries).slice()
+  const m = decodeZone(frame)
+  assert.ok(m && m.type === ZMSG.FAR)
+  assert.deepEqual({ ...m, entries: [...m.entries] }, { type: ZMSG.FAR, from: 63, domain: 0xfffe, tick: 1234, stride: 15, n: 3, entries: [...entries] })
+  for (let cut = 0; cut < 11; cut++) assert.equal(decodeZone(frame.subarray(0, cut)), null)
+})
+
+test('SHADOW round-trips, rejects overruns, leftovers and oversize payloads', () => {
+  const w = new ZoneWireWriter()
+  const payloads = [new Uint8Array(0), new Uint8Array(5).fill(7), new Uint8Array(300).map((_, i) => i & 0xff)]
+  const frame = w.shadow(63, 3, 9, -2, payloads)!.slice()
+  const m = decodeZone(frame)
+  assert.ok(m && m.type === ZMSG.SHADOW)
+  assert.equal(m.from, 63)
+  assert.equal(m.fromDomain, 3)
+  assert.equal(m.toDomain, 9)
+  assert.equal(m.firstTick, -2)
+  assert.equal(m.count, 3)
+  assert.deepEqual(m.payloads.map(p => [...p]), payloads.map(p => [...p]))
+  for (let cut = 0; cut < frame.length; cut++) assert.equal(decodeZone(frame.subarray(0, cut)), null, `cut ${cut}`)
+  const extra = new Uint8Array(frame.length + 1)
+  extra.set(frame)
+  assert.equal(decodeZone(extra), null)
+  const over = frame.slice()
+  over[12] = 0xff // first length prefix now overruns
+  assert.equal(decodeZone(over), null)
+  assert.equal(w.shadow(1, 1, 2, 0, [new Uint8Array(0x10000)]), null)
 })

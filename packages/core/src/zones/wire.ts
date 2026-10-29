@@ -1,6 +1,7 @@
 // Zone peer codec. Little-endian; byte 0 is type, byte 1 is sender.
 
-import { MAX_WIRE_PLAYERS, MAX_WIRE_TICKS } from '../wire.ts'
+import { MAX_SNAPSHOT_BYTES, MAX_WIRE_PLAYERS, MAX_WIRE_TICKS, SNAPSHOT_CHUNK } from '../wire.ts'
+import { fnv1a32 } from '../snap.ts'
 
 export const ZMSG = {
   CONTROL: 16,
@@ -114,10 +115,15 @@ const CONTROL_HEAD = 8 // type, from, firstTick, count, seats
 const ZINPUT_HEAD = 14 // type, from, domain, ackTick, firstTick, count, seats
 const ZINPUT_TAIL = 5 // senderTick, nChecks
 const CHECK_SIZE = 10 // domain u16, tick, hash
+const DSNAP_HEAD = 20 // type, from, domain, tick, part, parts, total, fnv
+const FAR_HEAD = 11 // type, from, domain, tick, stride, n
+const SHADOW_HEAD = 12 // type, from, fromDomain, toDomain, firstTick, count
 const SLEEP_HEAD = 12
 const WAKE_HEAD = 12
 const DROP_HEAD = 9
 const DESYNC_HEAD = 12
+
+const EMPTY = new Uint8Array(0)
 
 function clampInt(v: number, lo: number, hi: number): number {
   const n = v | 0
@@ -158,6 +164,81 @@ class OutBuf {
 /** Returned views share one buffer and are valid until the next writer call. */
 export class ZoneWireWriter {
   private out = new OutBuf(SLEEP_HEAD)
+  private snapBuf = new OutBuf(DSNAP_HEAD)
+  private parts: Uint8Array[] = []
+
+  /** DOMAIN_SNAPSHOT parts of SNAPSHOT_CHUNK bytes; an empty snapshot is one empty part. The array and views are reused. */
+  domainSnapshotParts(from: number, domain: number, tick: number, bytes: Uint8Array): Uint8Array[] {
+    const total = bytes.length
+    const fnv = fnv1a32(bytes)
+    let parts = 1
+    while (parts * SNAPSHOT_CHUNK < total) parts++
+    const o = this.snapBuf
+    o.ensure(parts * DSNAP_HEAD + total)
+    const buf = o.buf
+    const dv = o.dv
+    const out = this.parts
+    out.length = parts
+    let p = 0
+    for (let i = 0; i < parts; i++) {
+      const off = i * SNAPSHOT_CHUNK
+      const len = total - off < SNAPSHOT_CHUNK ? total - off : SNAPSHOT_CHUNK
+      const start = p
+      dv.setUint8(p, ZMSG.DOMAIN_SNAPSHOT)
+      dv.setUint8(p + 1, from & 0xff)
+      dv.setUint16(p + 2, domain, true)
+      dv.setUint32(p + 4, tick >>> 0, true)
+      dv.setUint16(p + 8, i, true)
+      dv.setUint16(p + 10, parts, true)
+      dv.setUint32(p + 12, total, true)
+      dv.setUint32(p + 16, fnv, true)
+      p += DSNAP_HEAD
+      buf.set(bytes.subarray(off, off + len), p)
+      p += len
+      out[i] = buf.subarray(start, p)
+    }
+    return out
+  }
+
+  /** FAR: display-only entries, copied after the header. */
+  far(from: number, domain: number, tick: number, stride: number, n: number, entries: Uint8Array): Uint8Array {
+    const len = FAR_HEAD + entries.length
+    const o = this.out
+    o.ensure(len)
+    o.buf.set(entries, FAR_HEAD)
+    this.header(ZMSG.FAR, from & 0xff, domain)
+    o.dv.setUint32(4, tick >>> 0, true)
+    o.dv.setUint8(8, stride)
+    o.dv.setUint16(9, n, true)
+    return o.view(len)
+  }
+
+  /** SHADOW: 1..MAX_WIRE_TICKS length-prefixed payloads. Null if a payload exceeds 0xFFFF bytes. */
+  shadow(from: number, fromDomain: number, toDomain: number, firstTick: number, payloads: readonly Uint8Array[]): Uint8Array | null {
+    const count = clampInt(payloads.length, 1, MAX_WIRE_TICKS)
+    let len = SHADOW_HEAD
+    for (let i = 0; i < count; i++) {
+      const pl = i < payloads.length ? payloads[i].length : 0
+      // Refused rather than truncated: a cut shadow input would silently desync the domain.
+      if (pl > 0xffff) return null
+      len += 2 + pl
+    }
+    const o = this.out
+    o.ensure(len)
+    const dv = o.dv
+    this.header(ZMSG.SHADOW, from & 0xff, fromDomain)
+    dv.setUint16(4, toDomain, true)
+    dv.setUint32(6, firstTick >>> 0, true)
+    dv.setUint8(10, count)
+    let p = SHADOW_HEAD
+    for (let i = 0; i < count; i++) {
+      const pl = i < payloads.length ? payloads[i] : EMPTY
+      dv.setUint16(p, pl.length, true)
+      o.buf.set(pl, p + 2)
+      p += 2 + pl.length
+    }
+    return o.view(len)
+  }
 
   /** CONTROL. count is clamped to 1..MAX_WIRE_TICKS, seats to 0..MAX_WIRE_PLAYERS. */
   control(m: ZControlMsg): Uint8Array {
@@ -320,6 +401,9 @@ const inputCodes = new CodeBuf()
 const checkPool: { domain: number; tick: number; hash: number }[] = []
 const controlMsg: ZControlMsg = { type: ZMSG.CONTROL, from: 0, firstTick: 0, count: 0, seats: 0, seatIds: new Uint16Array(0), words: new Uint32Array(0) }
 const inputMsg: ZInputMsg = { type: ZMSG.ZINPUT, from: 0, domain: 0, ackTick: 0, firstTick: 0, count: 0, seats: 0, seatIds: new Uint16Array(0), codes: new Uint32Array(0), senderTick: 0, checks: [] }
+const dsnapMsg: ZDomainSnapshotMsg = { type: ZMSG.DOMAIN_SNAPSHOT, from: 0, domain: 0, tick: 0, hash: 0, part: 0, parts: 0, totalLen: 0, bytes: EMPTY }
+const farMsg: ZFarMsg = { type: ZMSG.FAR, from: 0, domain: 0, tick: 0, stride: 0, n: 0, entries: EMPTY }
+const shadowMsg: ZShadowMsg = { type: ZMSG.SHADOW, from: 0, fromDomain: 0, toDomain: 0, firstTick: 0, count: 0, payloads: [] }
 const sleepMsg: ZSleepMsg = { type: ZMSG.SLEEP, from: 0, domain: 0, id: 0, tick: 0, pose: new Uint8Array(0) }
 const wakeMsg: ZWakeMsg = { type: ZMSG.WAKE, from: 0, domain: 0, id: 0, tick: 0 }
 const dropMsg: ZDropMsg = { type: ZMSG.ZDROP, from: 0, domain: 0, lostPeer: 0, lastTick: 0 }
@@ -382,10 +466,60 @@ function decodeInput(d: Uint8Array): ZInputMsg | null {
   return m
 }
 
+function decodeDomainSnapshot(d: Uint8Array): ZDomainSnapshotMsg | null {
+  const len = d.length
+  if (len < DSNAP_HEAD || len > DSNAP_HEAD + SNAPSHOT_CHUNK) return null
+  const part = u16(d, 8)
+  const parts = u16(d, 10)
+  const totalLen = u32(d, 12)
+  if (part >= parts || totalLen > MAX_SNAPSHOT_BYTES) return null
+  const m = dsnapMsg
+  m.from = d[1]
+  m.domain = u16(d, 2)
+  m.tick = tick32(d, 4)
+  m.part = part
+  m.parts = parts
+  m.totalLen = totalLen
+  m.hash = u32(d, 16)
+  m.bytes = d.subarray(DSNAP_HEAD, len)
+  return m
+}
+
+function decodeShadow(d: Uint8Array): ZShadowMsg | null {
+  const len = d.length
+  if (len < SHADOW_HEAD) return null
+  const count = d[10]
+  if (count < 1 || count > MAX_WIRE_TICKS) return null
+  // Validate the whole walk before touching the reused message.
+  let p = SHADOW_HEAD
+  for (let i = 0; i < count; i++) {
+    if (p + 2 > len) return null
+    p += 2 + u16(d, p)
+    if (p > len) return null
+  }
+  if (p !== len) return null
+  const m = shadowMsg
+  m.from = d[1]
+  m.fromDomain = u16(d, 2)
+  m.toDomain = u16(d, 4)
+  m.firstTick = tick32(d, 6)
+  m.count = count
+  const out = m.payloads
+  out.length = count
+  p = SHADOW_HEAD
+  for (let i = 0; i < count; i++) {
+    const n = u16(d, p)
+    out[i] = d.subarray(p + 2, p + 2 + n)
+    p += 2 + n
+  }
+  return m
+}
+
 /**
  * Never throws for packet bytes. Results are reused until the next decode of
  * the same type. SLEEP pose is a view into the input packet, without a copy.
- * Unknown types and short frames return null; CONTROL and ZINPUT need an exact length; fixed messages ignore trailing bytes.
+ * Covers all nine ZMSG types. Unknown types and short frames return null; CONTROL, ZINPUT
+ * and SHADOW need an exact length; FAR entries and SLEEP pose take the rest; fixed messages ignore trailing bytes.
  */
 export function decodeZone(data: Uint8Array): ZoneMessage | null {
   const len = data.length
@@ -395,6 +529,19 @@ export function decodeZone(data: Uint8Array): ZoneMessage | null {
       return decodeControl(data)
     case ZMSG.ZINPUT:
       return decodeInput(data)
+    case ZMSG.DOMAIN_SNAPSHOT:
+      return decodeDomainSnapshot(data)
+    case ZMSG.FAR:
+      if (len < FAR_HEAD) return null
+      farMsg.from = data[1]
+      farMsg.domain = u16(data, 2)
+      farMsg.tick = tick32(data, 4)
+      farMsg.stride = data[8]
+      farMsg.n = u16(data, 9)
+      farMsg.entries = data.subarray(FAR_HEAD)
+      return farMsg
+    case ZMSG.SHADOW:
+      return decodeShadow(data)
     case ZMSG.SLEEP:
       if (len < SLEEP_HEAD) return null
       sleepMsg.from = data[1]
