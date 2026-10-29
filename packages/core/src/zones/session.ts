@@ -1666,7 +1666,7 @@ export class ZoneSession<TInput> {
       for (let i = 0; i < d.inputs.seats.length; i++) {
         const seat = d.inputs.seats[i], buf = d.inputs.buffers[i]
         const drop = d.drops.get(this.seatOwner[seat])
-        if (now - this.lastNews[this.seatOwner[seat]] <= this.tuning.botTakeoverMs && buf.lastTick < (drop?.from ?? d.start)) continue
+        if (!this.observing(this.seatOwner[seat], Math.max(d.start, buf.lastTick + 1)) && now - this.lastNews[this.seatOwner[seat]] <= this.tuning.botTakeoverMs && buf.lastTick < (drop?.from ?? d.start)) continue
         const end = Math.min(this.tick + this.delayCtl.current, d.end - 1, this.limit - 1)
         for (let t = Math.max(d.start, buf.lastTick + 1); t <= end; t++) {
           const host = this.hostAt(d, seat, t)
