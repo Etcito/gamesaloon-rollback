@@ -3,5 +3,58 @@
     "name": "zone-scale-long",
     "command": "node --experimental-strip-types --test packages/core/test/long/zone-scale.long.ts",
     "timeout_s": 3600
+  },
+  {
+    "name": "build-for-domain-long",
+    "command": "npm run build",
+    "timeout_s": 600
+  },
+  {
+    "name": "domain-long-merge-split",
+    "command": "env DOMAIN_LONG_CASE=merge-split node --experimental-strip-types --test packages/rapier/test/domain-zoned.long.ts",
+    "timeout_s": 3600,
+    "after": [
+      "build-for-domain-long"
+    ]
+  },
+  {
+    "name": "domain-long-merge-split-mixed",
+    "command": "env DOMAIN_LONG_CASE=merge-split-mixed node --experimental-strip-types --test packages/rapier/test/domain-zoned.long.ts",
+    "timeout_s": 3600,
+    "after": [
+      "build-for-domain-long"
+    ]
+  },
+  {
+    "name": "domain-long-checkpoint",
+    "command": "env DOMAIN_LONG_CASE=checkpoint node --experimental-strip-types --test packages/rapier/test/domain-zoned.long.ts",
+    "timeout_s": 3600,
+    "after": [
+      "build-for-domain-long"
+    ]
+  },
+  {
+    "name": "domain-long-drop",
+    "command": "env DOMAIN_LONG_CASE=drop node --experimental-strip-types --test packages/rapier/test/domain-zoned.long.ts",
+    "timeout_s": 3600,
+    "after": [
+      "build-for-domain-long"
+    ]
+  },
+  {
+    "name": "domain-long-rejoin",
+    "command": "env DOMAIN_LONG_CASE=rejoin node --experimental-strip-types --test packages/rapier/test/domain-zoned.long.ts",
+    "timeout_s": 3600,
+    "after": [
+      "build-for-domain-long"
+    ]
+  },
+  {
+    "name": "domain-long-combined",
+    "command": "env DOMAIN_LONG_CASE=combined node --experimental-strip-types --test packages/rapier/test/domain-zoned.long.ts",
+    "timeout_s": 3600,
+    "after": [
+      "build-for-domain-long"
+    ]
   }
 ]
