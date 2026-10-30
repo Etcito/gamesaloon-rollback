@@ -9,15 +9,15 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
+      "types": ["./dist/index.d.ts", "./src/index.ts"],
       "default": "./dist/index.js"
     },
     "./netsim": {
-      "types": "./dist/netsim.d.ts",
+      "types": ["./dist/netsim.d.ts", "./src/netsim.ts"],
       "default": "./dist/netsim.js"
     },
     "./zones": {
-      "types": "./dist/zones/index.d.ts",
+      "types": ["./dist/zones/index.d.ts", "./src/zones/index.ts"],
       "default": "./dist/zones/index.js"
     }
   },
