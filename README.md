@@ -8,8 +8,8 @@ This repository is a monorepo of two packages:
 
 | package | path | what it is |
 | --- | --- | --- |
-| `@gamesaloon/rollback` 0.1.0 | `packages/core` | The rollback core. Pure TypeScript, zero runtime dependencies, no DOM. |
-| `@gamesaloon/rollback-rapier` 0.1.0 | `packages/rapier` | Snapshot, restore and hash for a Rapier world (deterministic build, pinned to 0.21.0). |
+| `@gamesaloon/rollback` 0.2.0 | `packages/core` | The rollback core. Pure TypeScript, zero runtime dependencies, no DOM. |
+| `@gamesaloon/rollback-rapier` 0.2.0 | `packages/rapier` | Snapshot, restore and hash for a Rapier world (deterministic build, pinned to 0.21.0). |
 
 ## What it does
 
@@ -55,7 +55,7 @@ To use the packages in another project, pack them and install the tarballs (test
 ```sh
 cd gamesaloon-rollback/packages/core  && npm pack --pack-destination /path/to/tarballs
 cd ../rapier                          && npm pack --pack-destination /path/to/tarballs
-cd /path/to/your-game                 && npm install /path/to/tarballs/gamesaloon-rollback-0.1.0.tgz /path/to/tarballs/gamesaloon-rollback-rapier-0.1.0.tgz
+cd /path/to/your-game                 && npm install /path/to/tarballs/gamesaloon-rollback-0.2.0.tgz /path/to/tarballs/gamesaloon-rollback-rapier-0.2.0.tgz
 ```
 
 `@gamesaloon/rollback-rapier` has `@dimforge/rapier3d-deterministic-compat` 0.21.0 as a peer dependency; npm installs
@@ -80,7 +80,7 @@ https://github.com/Etcito/gamesaloon-rollback/releases/download/v<version>/SHA25
 Install a release in your game (npm installs the rapier peer dependency with it):
 
 ```sh
-npm install https://github.com/Etcito/gamesaloon-rollback/releases/download/v0.1.0/gamesaloon-rollback-0.1.0.tgz             https://github.com/Etcito/gamesaloon-rollback/releases/download/v0.1.0/gamesaloon-rollback-rapier-0.1.0.tgz
+npm install https://github.com/Etcito/gamesaloon-rollback/releases/download/v0.2.0/gamesaloon-rollback-0.2.0.tgz             https://github.com/Etcito/gamesaloon-rollback/releases/download/v0.2.0/gamesaloon-rollback-rapier-0.2.0.tgz
 ```
 
 To cut a release: set the same `version` in `packages/core/package.json` and `packages/rapier/package.json`, commit,
@@ -209,7 +209,7 @@ peer. The short version (details in [`docs/DESIGN.md`](docs/DESIGN.md) section 2
 
 ## Status and limits
 
-Version 0.1.0 of both packages: early, not published, not battle-tested outside the tests below.
+Version 0.2.0 of both packages: early, not published, not battle-tested outside the tests below.
 
 - Tests: `npm test` runs core (26 tests: 2, 3 and 4 peers with latency, jitter, loss and reordering; several players
   per peer; observer; forced desync with dump and resync; late start; peer loss; wire, timing and codec units),
