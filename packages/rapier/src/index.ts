@@ -3,6 +3,19 @@ export type { RapierModule } from "./init.ts";
 export { fnv1a32 } from "./hash.ts";
 export { RapierWorldSim, FIXED_DT, TICK_RATE } from "./world-sim.ts";
 export type { BodyId, RapierWorldSimOptions } from "./world-sim.ts";
+export {
+  validateProceduralColliders,
+  proceduralColliderDesc,
+  ProceduralColliderSet,
+} from "./procedural-colliders.ts";
+export type {
+  ProceduralCollider,
+  ProceduralColliderShape,
+  ProceduralColliderError,
+  ProceduralColliderValidation,
+  ProceduralColliderPlacement,
+  ProceduralColliderOptions,
+} from "./procedural-colliders.ts";
 export { RapierDomainWorld } from "./domain-world.ts";
 export type { EntityId, JointId, DomainWorldSnapshot, DomainEntityBuilder, DomainJointBuilder } from "./domain-world.ts";
 export { rebuildDomain, exportEntities, mergeEntityStreams, ShadowProxies, kinematicByTick } from "./domain-rebuild.ts";
