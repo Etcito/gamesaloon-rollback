@@ -16,6 +16,41 @@ export type {
   ProceduralColliderPlacement,
   ProceduralColliderOptions,
 } from "./procedural-colliders.ts";
+export {
+  validateProceduralDynamics,
+} from "./procedural-dynamics.ts";
+export type {
+  ProceduralBodyType,
+  ProceduralJointKind,
+  ProceduralSurface,
+  ProceduralMotorMode,
+  ProceduralSwitchMode,
+  ProceduralLogicOp,
+  ProceduralEasing,
+  ProceduralLoop,
+  ProceduralMotor,
+  ProceduralBody,
+  ProceduralJoint,
+  ProceduralSwitch,
+  ProceduralLever,
+  ProceduralLogic,
+  ProceduralAnimationKey,
+  ProceduralAnimation,
+  ProceduralLinkTarget,
+  ProceduralLink,
+  ProceduralBudget,
+  ProceduralMechanisms,
+  ProceduralDynamics,
+  ProceduralDynamicsError,
+  ProceduralDynamicsValidation,
+} from "./procedural-dynamics.ts";
+export { ProceduralDynamicsSet } from "./procedural-dynamics-set.ts";
+export type { ProceduralDynamicsOptions } from "./procedural-dynamics-set.ts";
+export { ProceduralMechanismSet } from "./procedural-mechanisms.ts";
+export type {
+  ProceduralAnimationPlayState,
+  ProceduralAnimationStatus,
+} from "./procedural-mechanisms.ts";
 export { RapierDomainWorld } from "./domain-world.ts";
 export type { EntityId, JointId, DomainWorldSnapshot, DomainEntityBuilder, DomainJointBuilder } from "./domain-world.ts";
 export { rebuildDomain, exportEntities, mergeEntityStreams, ShadowProxies, kinematicByTick } from "./domain-rebuild.ts";
