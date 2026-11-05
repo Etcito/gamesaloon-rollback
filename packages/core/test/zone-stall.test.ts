@@ -66,6 +66,24 @@ test('zone seats keep the frame clock through boundary waits for a snapshot', ()
   for (let p = 0; p < sc.peers; p++) {
     const s = ctx.sessions[p].stats
     assert.ok(s.stallFrames > 0, `scenario: peer ${p} waited`)
-    assert.ok(s.tick >= total - 1, `peer ${p} reached tick ${s.tick} after ${total} frames`)
+    // The clock is kept: only the ticks skipped on purpose to let a waiting peer catch up are missing.
+    assert.ok(s.tick + s.syncSkips >= total - 1, `peer ${p} reached tick ${s.tick} (+${s.syncSkips} skipped) after ${total} frames`)
   }
+})
+
+test('zone session started late by one page closes the gap: the leader skips ticks instead of predicting at its cap', () => {
+  // Two pages never start at the same instant (a browser loads, compiles, opens its channels). Without time sync the
+  // earlier one stays maxPrediction ahead for the whole session and every remote input rolls it back that far.
+  const gaps: number[] = []
+  const sc: ZoneScenario = {
+    peers: 2, seed: 11, frames: 900, settle: 60, factory, link: { rttMs: 0, jitterMs: 0 },
+    hook: (frame, ctx) => {
+      ctx.alive[1] = frame >= 20
+      if (frame === 200 || frame === 899) gaps.push(ctx.sessions[0].stats.tick - ctx.sessions[1].stats.tick)
+    },
+  }
+  const ctx = zoneSetup(sc)
+  assert.deepEqual(zoneRun(sc, ctx), [])
+  assert.ok(gaps[0] > 3, `scenario: the late page should still trail at frame 200 (gap ${gaps[0]})`)
+  assert.ok(Math.abs(gaps[1]) <= 3, `the pages stay ${gaps[1]} ticks apart after 900 frames`)
 })

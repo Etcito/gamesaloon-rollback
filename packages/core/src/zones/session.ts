@@ -5,7 +5,7 @@ import { InputBuffer } from '../inputBuffer.ts'
 import { MAX_FRAME_DT } from '../rollback.ts'
 import { SnapReader, SnapWriter } from '../snap.ts'
 import { CorrectionSmoother } from '../smoothing.ts'
-import { DEFAULT_LOST_AFTER_MS, DEFAULT_DROP_WAIT_MS, DEFAULT_DELAY_HIDDEN_TICKS, DEFAULT_MAX_DELAY, DEFAULT_MAX_PREDICTION, DEFAULT_MIN_DELAY, DEFAULT_TICK_RATE, DelayController, MAX_PEERS } from '../timing.ts'
+import { DEFAULT_LOST_AFTER_MS, DEFAULT_DROP_WAIT_MS, DEFAULT_DELAY_HIDDEN_TICKS, DEFAULT_MAX_DELAY, DEFAULT_MAX_PREDICTION, DEFAULT_MIN_DELAY, DEFAULT_TICK_RATE, DelayController, MAX_PEERS, RttEstimator, TimeSync } from '../timing.ts'
 import type { InputCodec, NetChannel, RollbackTuning } from '../types.ts'
 import { MAX_WIRE_PLAYERS, MAX_WIRE_TICKS, MSG, SnapshotAssembler, WireWriter } from '../wire.ts'
 import type { SnapshotMsg } from '../wire.ts'
@@ -30,6 +30,8 @@ export type { FarSink } from './far.ts'
 /** Silence after which a heard peer gets the reliable frames of the gap again: the longer of these two. */
 const DEFAULT_RESEND_SILENCE_MS = 100
 const DEFAULT_RESEND_SILENCE_TICKS = 4
+/** Local input ticks whose store time is kept for the ack round trip. */
+const SENT_AT_RING = 256
 
 export interface ZoneSessionConfig<TInput>
   extends Pick<RollbackTuning, 'tickRate' | 'maxPrediction' | 'minDelay' | 'maxDelay' | 'delayHiddenTicks' | 'lostAfterMs' | 'dropWaitMs'> {
@@ -71,6 +73,8 @@ export interface ZoneStats {
   malformed: number
   lostPeers: number[]
   sleepTransitions: number
+  /** Ticks the session skipped to let a peer it led by more than TIME_SYNC_MAX_ADVANTAGE catch up. */
+  syncSkips: number
 }
 
 /** One domain replicated by the local peer. */
@@ -200,6 +204,19 @@ export class ZoneSession<TInput> {
    */
   private readonly maxOwed: number
   private readonly maxPrediction: number
+  /**
+   * Frame advantage over each peer, from the senderTick of its CONTROL and ZINPUT. Pages never start a session at
+   * the same instant: without it the earlier one stays maxPrediction ahead for the whole session, so every remote
+   * input lands that many ticks late and rolls every replicated domain back that far, every tick. The leader skips
+   * a tick (as RollbackSession does) until the advantage is within TIME_SYNC_MAX_ADVANTAGE.
+   */
+  private readonly timeSync: TimeSync
+  /** Round trip to each peer, from the ZINPUT ackTick of local input ticks (sent at sentAt), for timeSync. */
+  private readonly rttEst: RttEstimator[] = Array.from({ length: MAX_PEERS }, () => new RttEstimator())
+  private readonly sentAt = new Float64Array(SENT_AT_RING)
+  private readonly ackSeen = new Int32Array(MAX_PEERS).fill(-1)
+  /** Session tick of each peer's last timing sample: one per peer and tick, whatever the number of its domains. */
+  private readonly timedAt = new Float64Array(MAX_PEERS).fill(-1)
   /** Retains a full keyframe interval plus check latency, prediction, delay and assignment lead. */
   private readonly inputCapacity: number
   /**
@@ -277,6 +294,7 @@ export class ZoneSession<TInput> {
     const tickRate = cfg.tickRate ?? DEFAULT_TICK_RATE
     if (!(tickRate > 0 && tickRate < Infinity)) throw new Error('[zones] session: bad tickRate')
     this.fixedDt = 1 / tickRate
+    this.timeSync = new TimeSync(tickRate)
     this.maxSubsteps = cfg.maxSubsteps ?? Math.ceil(MAX_FRAME_DT * tickRate)
     if (!(Number.isInteger(this.maxSubsteps) && this.maxSubsteps >= 1)) throw new Error('[zones] session: bad maxSubsteps')
     this.maxPrediction = cfg.maxPrediction ?? DEFAULT_MAX_PREDICTION
@@ -322,7 +340,7 @@ export class ZoneSession<TInput> {
     this.limit = cfg.tuning.epochTicks
     this.stats = {
       tick: 0, confirmedTick: {}, delay: this.delayCtl.current, frames: 0, rollbacks: 0, maxRollback: 0, resimTicks: 0,
-      stallFrames: 0, desyncs: 0, malformed: 0, lostPeers: [], sleepTransitions: 0,
+      stallFrames: 0, desyncs: 0, malformed: 0, lostPeers: [], sleepTransitions: 0, syncSkips: 0,
     }
 
     // Epoch 0: every domain the local peer replicates, created in ascending id order.
@@ -405,6 +423,11 @@ export class ZoneSession<TInput> {
     this.acc += dt
     let due = Math.floor(this.acc / this.fixedDt)
     if (due > this.maxSubsteps) due = this.maxSubsteps
+    if (due > 0 && this.timeSync.shouldSkip(this.tick)) {
+      this.acc -= this.fixedDt
+      due--
+      stats.syncSkips++
+    }
     this.isStalled = false
     for (let i = 0; i < due; i++) {
       if (this.localStalled()) {
@@ -711,7 +734,9 @@ export class ZoneSession<TInput> {
     for (let i = 0; i < seats.length; i++) this.localCodes[i] = this.codec.encode(this.localIn[i]) >>> 0
     let next = this.localBufs[0].lastTick + 1
     if (next < tick) next = tick
+    const now = this.net!.now()
     for (let t = next; t <= tick + delay; t++) {
+      this.sentAt[t % SENT_AT_RING] = now
       for (let i = 0; i < seats.length; i++) {
         if (!this.observing(this.cfg.localPeer, t)) this.lastControl[seats[i]] = this.localControls[i]
         this.controls.set(seats[i], t, this.observing(this.cfg.localPeer, t) ? this.observerWord(this.localControls[i]) : this.localControls[i])
@@ -860,6 +885,22 @@ export class ZoneSession<TInput> {
     }
   }
 
+  private observeTiming(from: number, senderTick: number, ackTick: number): void {
+    if (from < 0 || from >= MAX_PEERS) return
+    const est = this.rttEst[from]
+    // The first ack of a local input tick still in the ring: its store time to now is one round trip (plus at most a
+    // frame of the peer's send cadence, which only lowers the advantage seen).
+    const last = this.localSeats.length > 0 ? this.localBufs[0].lastTick : -1
+    if (ackTick > this.ackSeen[from] && ackTick >= 0 && ackTick <= last && last - ackTick < SENT_AT_RING) {
+      this.ackSeen[from] = ackTick
+      est.sample(this.net!.now() - this.sentAt[ackTick % SENT_AT_RING])
+    }
+    // A lost, observing or rejoining peer is brought back by snapshots, never waited for.
+    if (this.timedAt[from] === this.tick || !this.roster.live[from] || this.observing(from, this.tick) || this.observing(this.cfg.localPeer, this.tick)) return
+    this.timedAt[from] = this.tick
+    this.timeSync.observe(from, senderTick, this.tick, est.rtt)
+  }
+
   /** The state of a domain id that holds tick t: the current one from its start, else an old one kept for the grace. */
   private stateFor(id: DomainId, t: number): DomainState<TInput> | undefined {
     const d = this.byId.get(id)
@@ -877,6 +918,7 @@ export class ZoneSession<TInput> {
       this.stats.malformed++
       return
     }
+    this.observeTiming(m.from, m.senderTick, m.ackTick)
     // Each check names its domain and tick; one past an unplanned boundary is dropped and comes again by rotation.
     for (let i = 0; i < m.checks.length; i++) {
       const c = m.checks[i]
@@ -1658,6 +1700,8 @@ export class ZoneSession<TInput> {
       if (all) {
         this.lost[p] = 2
         this.stats.lostPeers.push(p)
+        this.timeSync.forget(p)
+        this.rttEst[p].reset()
         this.onPeerLost?.(p, last)
       }
     }
