@@ -1069,26 +1069,30 @@ export class ZoneSession<TInput> {
     if (last > this.controlSent) this.controlSent = last
   }
 
-  /** CONTROL of ticks first..last of the local seats, to one peer or (to < 0) to every other peer. */
+  /**
+   * CONTROL of ticks first..last of the local seats, to one peer or (to < 0) to every other peer. A peer holding more
+   * local seats than one message carries (bots filling a 60-seat room) sends them in batches of MAX_WIRE_PLAYERS.
+   */
   private controlOut(first: number, last: number, to: number): void {
     const seats = this.localSeats
-    const ns = seats.length < MAX_WIRE_PLAYERS ? seats.length : MAX_WIRE_PLAYERS
-    if (ns === 0) return
     const m = this.ctlOut
     m.from = this.cfg.localPeer
-    m.seats = ns
-    for (let j = 0; j < ns; j++) m.seatIds[j] = seats[j]
-    while (first <= last) {
-      let count = last - first + 1
-      if (count > MAX_WIRE_TICKS) count = MAX_WIRE_TICKS
-      for (let t = 0; t < count; t++) {
-        for (let j = 0; j < ns; j++) m.words[t * ns + j] = this.controls.get(seats[j], first + t) >>> 0
+    for (let s0 = 0; s0 < seats.length; s0 += MAX_WIRE_PLAYERS) {
+      const ns = seats.length - s0 < MAX_WIRE_PLAYERS ? seats.length - s0 : MAX_WIRE_PLAYERS
+      m.seats = ns
+      for (let j = 0; j < ns; j++) m.seatIds[j] = seats[s0 + j]
+      for (let f = first; f <= last;) {
+        let count = last - f + 1
+        if (count > MAX_WIRE_TICKS) count = MAX_WIRE_TICKS
+        for (let t = 0; t < count; t++) {
+          for (let j = 0; j < ns; j++) m.words[t * ns + j] = this.controls.get(seats[s0 + j], f + t) >>> 0
+        }
+        m.firstTick = f
+        m.count = count
+        if (to < 0) this.fanOut(this.others, 'reliable', this.writer.control(m))
+        else this.net!.send(to, 'reliable', this.writer.control(m))
+        f += count
       }
-      m.firstTick = first
-      m.count = count
-      if (to < 0) this.fanOut(this.others, 'reliable', this.writer.control(m))
-      else this.net!.send(to, 'reliable', this.writer.control(m))
-      first += count
     }
   }
 
