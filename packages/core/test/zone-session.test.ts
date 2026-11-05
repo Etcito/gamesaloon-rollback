@@ -37,6 +37,13 @@ test('zone replicas agree on every shared per-domain confirmed hash, 2 to 8 peer
   }
 })
 
+test('zone peer with more local seats than one CONTROL carries still confirms (bots filling a big room)', () => {
+  const sc: ZoneScenario = { peers: 2, seats: [12, 1], seed: 5, frames: 240, settle: 120, factory, link: { rttMs: 40, jitterMs: 8 } }
+  const ctx = zoneSetup(sc)
+  assert.deepEqual(zoneRun(sc, ctx), [])
+  for (const s of ctx.sessions) assert.ok(s.stats.confirmedTick[0] >= sc.frames, `global confirmed ${s.stats.confirmedTick[0]}`)
+})
+
 test('zone local seat keeps predicting while a far domain stalls', () => {
   // One epoch: the stall window crosses no boundary, whose plan would wait for the late controls too.
   const sc: ZoneScenario = { peers: 4, frames: 240, settle: 180, factory, tuning: { epochTicks: 600 } }
