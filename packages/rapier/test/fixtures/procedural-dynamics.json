@@ -1,0 +1,250 @@
+{
+  "colliders": [
+    {
+      "instance": 0,
+      "key": 1,
+      "shape": "cuboid",
+      "t": [0, -0.5, 0],
+      "r": [0, 0, 0, 1],
+      "halfExtents": [10, 0.5, 10]
+    },
+    {
+      "instance": 1,
+      "key": 2,
+      "shape": "cuboid",
+      "t": [-2.5, 0.6, 2.5],
+      "r": [0, 0, 0, 1],
+      "halfExtents": [1.5, 0.1, 0.2]
+    },
+    {
+      "instance": 2,
+      "key": 3,
+      "shape": "cuboid",
+      "t": [-2.5, 0.6, -2.5],
+      "r": [0, 0, 0, 1],
+      "halfExtents": [1.5, 0.1, 0.2]
+    },
+    {
+      "instance": 3,
+      "key": 4,
+      "shape": "cuboid",
+      "t": [-6, 1, 0],
+      "r": [0, 0, 0, 1],
+      "halfExtents": [0.3, 1, 0.3]
+    },
+    {
+      "instance": 4,
+      "key": 5,
+      "shape": "cuboid",
+      "t": [4, 1.2, 0],
+      "r": [0, 0, 0, 1],
+      "halfExtents": [1, 1, 0.1]
+    },
+    {
+      "instance": 5,
+      "key": 6,
+      "shape": "cuboid",
+      "t": [0, 0.05, 0],
+      "r": [0, 0, 0, 1],
+      "halfExtents": [1, 0.05, 1]
+    },
+    {
+      "instance": 6,
+      "key": 7,
+      "shape": "cuboid",
+      "t": [0, 1.5, 0],
+      "r": [0, 0, 0, 1],
+      "halfExtents": [0.5, 0.2, 0.5]
+    }
+  ],
+  "physics": {
+    "bodies": [
+      {
+        "id": "static",
+        "type": "fixed",
+        "colliders": [0],
+        "parts": [],
+        "t": [0, 0, 0],
+        "r": [0, 0, 0, 1],
+        "density": 1,
+        "friction": 0.5,
+        "restitution": 0,
+        "linearDamping": 0,
+        "angularDamping": 0,
+        "gravityScale": 1,
+        "ccd": false,
+        "surface": "normal"
+      },
+      {
+        "id": "b01",
+        "type": "kinematic",
+        "colliders": [1],
+        "parts": [],
+        "t": [-2.5, 0.6, 2.5],
+        "r": [0, 0, 0, 1],
+        "density": 1,
+        "friction": 0.5,
+        "restitution": 0,
+        "linearDamping": 0,
+        "angularDamping": 0,
+        "gravityScale": 1,
+        "ccd": false,
+        "surface": "normal"
+      },
+      {
+        "id": "b02",
+        "type": "kinematic",
+        "colliders": [2],
+        "parts": [],
+        "t": [-2.5, 0.6, -2.5],
+        "r": [0, 0, 0, 1],
+        "density": 1,
+        "friction": 0.5,
+        "restitution": 0,
+        "linearDamping": 0,
+        "angularDamping": 0,
+        "gravityScale": 1,
+        "ccd": false,
+        "surface": "normal"
+      },
+      {
+        "id": "b03",
+        "type": "kinematic",
+        "colliders": [3],
+        "parts": [],
+        "t": [-6, 1, 0],
+        "r": [0, 0, 0, 1],
+        "density": 1,
+        "friction": 0.5,
+        "restitution": 0,
+        "linearDamping": 0,
+        "angularDamping": 0,
+        "gravityScale": 1,
+        "ccd": false,
+        "surface": "normal"
+      },
+      {
+        "id": "b04",
+        "type": "dynamic",
+        "colliders": [4],
+        "parts": [],
+        "t": [4, 1.2, 0],
+        "r": [0, 0, 0, 1],
+        "density": 50,
+        "friction": 0.5,
+        "restitution": 0,
+        "linearDamping": 0,
+        "angularDamping": 0,
+        "gravityScale": 1,
+        "ccd": false,
+        "surface": "normal"
+      },
+      {
+        "id": "b05",
+        "type": "fixed",
+        "colliders": [5],
+        "parts": [],
+        "t": [0, 0.05, 0],
+        "r": [0, 0, 0, 1],
+        "density": 1,
+        "friction": 0.5,
+        "restitution": 0,
+        "linearDamping": 0,
+        "angularDamping": 0,
+        "gravityScale": 1,
+        "ccd": false,
+        "surface": "normal"
+      },
+      {
+        "id": "b06",
+        "type": "dynamic",
+        "colliders": [6],
+        "parts": [],
+        "t": [0, 1.5, 0],
+        "r": [0, 0, 0, 1],
+        "density": 100,
+        "friction": 0.5,
+        "restitution": 0,
+        "linearDamping": 0,
+        "angularDamping": 0,
+        "gravityScale": 1,
+        "ccd": false,
+        "surface": "normal"
+      }
+    ],
+    "joints": [
+      {
+        "id": "door-hinge",
+        "kind": "hinge",
+        "a": "static",
+        "b": "b04",
+        "anchorA": [3, 1.2, 0],
+        "anchorB": [-1, 0, 0],
+        "axis": [0, 1, 0],
+        "limitsDeg": [0, 100]
+      }
+    ]
+  },
+  "mechanisms": {
+    "animations": [
+      {
+        "id": "spin-a",
+        "target": "b01",
+        "keys": [
+          { "atS": 0, "t": [0, 0, 0], "rDeg": [0, 0, 0] },
+          { "atS": 5, "t": [0, 0, 0], "rDeg": [0, 360, 0] }
+        ],
+        "easing": "linear",
+        "loop": "loop",
+        "autostart": true
+      },
+      {
+        "id": "spin-b",
+        "target": "b02",
+        "keys": [
+          { "atS": 0, "t": [0, 0, 0], "rDeg": [0, 0, 0] },
+          { "atS": 7, "t": [0, 0, 0], "rDeg": [0, 360, 0] }
+        ],
+        "easing": "linear",
+        "loop": "loop",
+        "autostart": true
+      },
+      {
+        "id": "hammer-swing",
+        "target": "b03",
+        "keys": [
+          { "atS": 0, "t": [0, 0, 0], "rDeg": [0, 0, 0] },
+          { "atS": 1.5, "t": [0, 0, 0], "rDeg": [0, 0, 45] }
+        ],
+        "easing": "smooth",
+        "loop": "pingpong",
+        "autostart": true
+      }
+    ],
+    "switches": [
+      {
+        "id": "plate-switch",
+        "plate": "b05",
+        "mode": "weight",
+        "onKg": 20,
+        "offKg": 10
+      }
+    ],
+    "links": [
+      {
+        "id": "door-link",
+        "from": "plate-switch",
+        "to": {
+          "kind": "door",
+          "joint": "door-hinge",
+          "openDeg": 90,
+          "closedDeg": 0
+        }
+      }
+    ],
+    "budget": {
+      "dynamicBodies": 2,
+      "joints": 1
+    }
+  }
+}
