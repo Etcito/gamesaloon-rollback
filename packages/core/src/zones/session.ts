@@ -75,6 +75,9 @@ export interface ZoneStats {
   sleepTransitions: number
   /** Ticks the session skipped to let a peer it led by more than TIME_SYNC_MAX_ADVANTAGE catch up. */
   syncSkips: number
+  /** Highest averaged advantage over a peer, in ticks, and the round trip (ms) behind it, as time sync sees them. */
+  syncAdvantage: number
+  syncRttMs: number
 }
 
 /** One domain replicated by the local peer. */
@@ -340,7 +343,7 @@ export class ZoneSession<TInput> {
     this.limit = cfg.tuning.epochTicks
     this.stats = {
       tick: 0, confirmedTick: {}, delay: this.delayCtl.current, frames: 0, rollbacks: 0, maxRollback: 0, resimTicks: 0,
-      stallFrames: 0, desyncs: 0, malformed: 0, lostPeers: [], sleepTransitions: 0, syncSkips: 0,
+      stallFrames: 0, desyncs: 0, malformed: 0, lostPeers: [], sleepTransitions: 0, syncSkips: 0, syncAdvantage: 0, syncRttMs: 0,
     }
 
     // Epoch 0: every domain the local peer replicates, created in ascending id order.
@@ -450,6 +453,10 @@ export class ZoneSession<TInput> {
     this.dropGrace()
     stats.tick = this.tick
     stats.delay = delay
+    stats.syncAdvantage = this.timeSync.maxAdvantage()
+    let rtt = 0
+    for (const p of this.others) if (this.rttEst[p].rtt > rtt) rtt = this.rttEst[p].rtt
+    stats.syncRttMs = rtt
     const a = this.acc / this.fixedDt
     return a > 0 ? (a < 1 ? a : 1) : 0
   }
