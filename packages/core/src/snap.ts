@@ -82,6 +82,13 @@ export class SnapWriter {
     }
   }
 
+  /** Appends bytes as they are, in one copy (a byte loop of u8() costs a bounds check and a DataView call per byte). */
+  raw(src: Uint8Array): void {
+    this.ensure(src.length)
+    this.buf.set(src, this.pos)
+    this.pos += src.length
+  }
+
   /** A view of the used part; valid until the next write. */
   bytes(): Uint8Array {
     return this.buf.subarray(0, this.pos)
@@ -111,6 +118,12 @@ export class SnapReader {
 
   u8(): number {
     return this.view.getUint8(this.take(1))
+  }
+
+  /** The next n bytes written by SnapWriter.raw, as a view of the buffer (valid while the buffer is). */
+  raw(n: number): Uint8Array {
+    const p = this.take(n)
+    return this.buf.subarray(p, p + n)
   }
 
   u16(): number {

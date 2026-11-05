@@ -250,6 +250,18 @@ class Buf {
     return this.#buf.subarray(0, this.#pos);
   }
 
+  /** SnapWriter.raw / SnapReader.raw: bytes as they are, in one copy. */
+  raw(v: Uint8Array | number): Uint8Array {
+    if (typeof v === "number") {
+      const p = this.#take(v);
+      return this.#buf.subarray(p, p + v);
+    }
+    this.#ensure(v.length);
+    this.#buf.set(v, this.#pos);
+    this.#pos += v.length;
+    return v;
+  }
+
   u8(v?: number): number {
     if (v === undefined) return this.#view.getUint8(this.#take(1));
     this.#ensure(1);

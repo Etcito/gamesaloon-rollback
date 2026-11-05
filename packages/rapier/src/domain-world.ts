@@ -122,9 +122,7 @@ function writeParams(w: ByteSink, params: Uint8Array): void {
 
 function readParams(r: SnapReader): Uint8Array {
   const n = r.u16();
-  const out = new Uint8Array(n);
-  for (let i = 0; i < n; i++) out[i] = r.u8();
-  return out;
+  return r.raw(n).slice();
 }
 
 /** Snapshot-form pose: translation, then rotation, all f64. The same bytes in exports, SLEEP and the awake block. */
@@ -341,7 +339,7 @@ export class RapierDomainWorld {
     }
     const rapier = this.sim.takeSnapshot();
     w.u32(rapier.length);
-    for (let i = 0; i < rapier.length; i++) w.u8(rapier[i]);
+    w.raw(rapier);
   }
 
   /** Replaces every table and the World. Joint handles stay valid: the RPR1 blob restores the same handles. */
@@ -386,7 +384,7 @@ export class RapierDomainWorld {
     }
     const rapierLen = r.u32();
     if (this.#rapierBytes.length < rapierLen) this.#rapierBytes = new Uint8Array(rapierLen);
-    for (let i = 0; i < rapierLen; i++) this.#rapierBytes[i] = r.u8();
+    this.#rapierBytes.set(r.raw(rapierLen));
     this.sim.restoreSnapshot(this.#rapierBytes.subarray(0, rapierLen));
     this.#entities = entities;
     this.#joints = joints;
