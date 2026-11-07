@@ -16,6 +16,12 @@ export type {
   ProceduralColliderPlacement,
   ProceduralColliderOptions,
 } from "./procedural-colliders.ts";
+export { ProceduralKinematics } from "./procedural-kinematic.ts";
+export type {
+  LocalCollider,
+  ProceduralColliderFrame,
+  ProceduralKinematicsOptions,
+} from "./procedural-kinematic.ts";
 export {
   validateProceduralDynamics,
 } from "./procedural-dynamics.ts";
