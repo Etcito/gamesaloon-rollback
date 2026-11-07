@@ -69,6 +69,9 @@ export class ProceduralKinematics {
   readonly #placement: ProceduralColliderPlacement;
   readonly #baseId: number;
   readonly #bodies = new Map<number, FrameBody>();
+  // Keep removed associations: an older snapshot can bring those bodies back.
+  readonly #history = new Map<BodyId, { key: number; entry: FrameBody }>();
+  #liveWorld: RAPIER.World;
   #disposed = false;
 
   constructor(
@@ -77,6 +80,7 @@ export class ProceduralKinematics {
     options: ProceduralKinematicsOptions = {},
   ) {
     this.#world = world;
+    this.#liveWorld = world.world;
     this.#rapier = rapier;
     this.#placement = options.placement ?? IDENTITY_PLACEMENT;
     this.#baseId = options.baseId ?? 0;
@@ -84,6 +88,16 @@ export class ProceduralKinematics {
 
   get baseId(): number {
     return this.#baseId;
+  }
+
+  #syncRestoredBodies(): void {
+    if (this.#liveWorld === this.#world.world) return;
+    this.#liveWorld = this.#world.world;
+    this.#bodies.clear();
+    for (const id of this.#world.ids()) {
+      const saved = this.#history.get(id);
+      if (saved !== undefined) this.#bodies.set(saved.key, saved.entry);
+    }
   }
 
   #pose(frame: ProceduralColliderFrame): { t: RAPIER.Vector; r: RAPIER.Rotation } {
@@ -104,6 +118,7 @@ export class ProceduralKinematics {
 
   apply(frames: readonly ProceduralColliderFrame[]): void {
     if (this.#disposed) throw new Error("procedural kinematics is disposed");
+    this.#syncRestoredBodies();
     const byKey = new Map<number, ProceduralColliderFrame>();
     for (const frame of frames) byKey.set(frame.key, frame);
     const keys = [...byKey.keys()].sort((a, b) => a - b);
@@ -133,7 +148,9 @@ export class ProceduralKinematics {
         const bodyRef = this.#world.body(body);
         bodyRef.setNextKinematicTranslation(pose.t);
         bodyRef.setNextKinematicRotation(pose.r);
-        this.#bodies.set(key, { body, colliders });
+        const created = { body, colliders };
+        this.#bodies.set(key, created);
+        this.#history.set(body, { key, entry: created });
         continue;
       }
       const body = this.#world.body(entry.body);
@@ -143,6 +160,7 @@ export class ProceduralKinematics {
   }
 
   bodyOf(key: number): BodyId | undefined {
+    this.#syncRestoredBodies();
     const entry = this.#bodies.get(key);
     if (entry === undefined) return undefined;
     return this.#world.hasBody(entry.body) ? entry.body : undefined;
@@ -150,6 +168,7 @@ export class ProceduralKinematics {
 
   dispose(): void {
     if (this.#disposed) return;
+    this.#syncRestoredBodies();
     this.#disposed = true;
     const keys = [...this.#bodies.keys()].sort((a, b) => a - b);
     for (const key of keys) {
@@ -157,5 +176,6 @@ export class ProceduralKinematics {
       if (this.#world.hasBody(entry.body)) this.#world.removeBody(entry.body);
     }
     this.#bodies.clear();
+    this.#history.clear();
   }
 }

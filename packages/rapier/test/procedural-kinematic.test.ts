@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { getR } from "./scenario.ts";
 import {
   ProceduralKinematics,
@@ -213,4 +217,132 @@ test("(c) placement moves the body while collider offsets stay local", () => {
 
   kin.dispose();
   sim.free();
+});
+
+// Use MAMA's native procgen::call integration (MAMA@85a1425). Runtime handles
+// must stay in one process; the single-call procgen-eval CLI cannot retain them.
+function nativeFrames(): { tick: number; ok: boolean; colliderFrames: ProceduralColliderFrame[] }[] {
+  const dir = mkdtempSync(join(tmpdir(), "kinematic-native-"));
+  const mama = resolve(process.env.MAMA_ROOT ?? fileURLToPath(new URL("../../../../MAMA", import.meta.url)));
+  try {
+    mkdirSync(join(dir, "src"));
+    writeFileSync(join(dir, "Cargo.toml"), `[package]
+name = "kinematic-replay-frames"
+version = "0.0.0"
+edition = "2024"
+[dependencies]
+mama-procgen = { path = ${JSON.stringify(join(mama, "crates/procgen"))} }
+`);
+    writeFileSync(join(dir, "src/main.rs"), String.raw`
+use std::io::{self, Read};
+use procgen::{call, json::{self, Json}};
+fn main() {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).unwrap();
+    let created = call(5, input.as_bytes()).unwrap();
+    let Json::Obj(fields) = json::parse(std::str::from_utf8(&created).unwrap()).unwrap() else { panic!("object") };
+    let Json::Num(handle) = fields.iter().find(|(k, _)| k == "handle").unwrap().1 else { panic!("handle") };
+    let last: u32 = std::env::args().nth(1).unwrap().parse().unwrap();
+    for tick in (0..=last).chain(61..=last) {
+        let request = format!(r#"{{"handle":{handle},"tick":{tick}}}"#);
+        let result = call(7, request.as_bytes()).unwrap();
+        println!("{}", std::str::from_utf8(&result).unwrap());
+    }
+    call(8, format!(r#"{{"handle":{handle}}}"#).as_bytes()).unwrap();
+}
+`);
+    const built = spawnSync("cargo", ["build", "--offline", "--quiet", "--manifest-path", join(dir, "Cargo.toml"), "--target-dir", join(dir, "target"), "-j", "1"], { encoding: "utf8", timeout: 60000 });
+    assert.equal(built.status, 0, `${built.error ?? ""}\n${built.stderr}`);
+    const input = {
+      version: 1, timeTicks: 0, paramValues: {},
+      sources: { "prim:prim": { kind: "primitive", tree: { root: "box", nodes: {
+        box: { kind: "box", params: { size: [4, 0.5, 4] },
+          transform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+          pivot: [0, 0, 0], op: "union", smooth: 0, visible: true,
+          color: "#ffffff", material: "", gameCollision: true, round: 0 },
+      } } } },
+      graph: {
+        format: "sdfm.procedural-graph", version: 1, seed: 0,
+        nodes: [
+          { id: "prim", type: "input_primitive", params: { primitive: { kind: "box", params: { size: [4, 0.5, 4] } } } },
+          { id: "points", type: "array_radial", params: { count: 1, faceOutward: false } },
+          { id: "place", type: "instance_on_points" },
+          { id: "out", type: "output" },
+        ],
+        links: [
+          { from: { node: "points", port: "out" }, to: { node: "place", port: "points" } },
+          { from: { node: "prim", port: "out" }, to: { node: "place", port: "geometry" } },
+          { from: { node: "place", port: "out" }, to: { node: "out", port: "in" } },
+        ],
+        params: [{ name: "radius", label: "Radius", type: "number", default: 1,
+          binds: [{ node: "points", param: "radius" }],
+          driver: { kind: "time", wave: "sine", period: 2, amplitude: 0.25, offset: 1 } }],
+      },
+    };
+    const run = (last: number) => {
+      const result = spawnSync(join(dir, "target/debug/kinematic-replay-frames"), [String(last)], {
+        input: JSON.stringify(input), encoding: "utf8", timeout: 60000, maxBuffer: 8 * 1024 * 1024,
+      });
+      assert.equal(result.status, 0, `${result.error ?? ""}\n${result.stderr}`);
+      return result.stdout.trim().split("\n").map((line) => JSON.parse(line));
+    };
+    const probe = run(0);
+    assert.equal(probe[0].ok, true, JSON.stringify(probe[0].issues));
+    assert.equal(probe[0].colliderFrames.length, 1);
+    return run(120);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("P11: native kinematic frames replay byte-identically after tick-60 restore with dynamic contact", () => {
+  const deltas = nativeFrames();
+  assert.equal(deltas.length, 181);
+  const initial = deltas[0].colliderFrames[0];
+  assert.notDeepEqual(deltas[30].colliderFrames[0].t, initial.t, "native driver moves the platform");
+  const sim = new RapierWorldSim(R);
+  const kin = new ProceduralKinematics(sim, R);
+  try {
+    kin.apply(deltas[0].colliderFrames);
+    const platformId = kin.bodyOf(initial.key)!;
+    const ballId = sim.createBody(R.RigidBodyDesc.dynamic().setTranslation(1, 1, 0), [R.ColliderDesc.ball(0.25).setFriction(1)]);
+    const snapshots: Uint8Array[] = [];
+    let contacts = 0;
+    for (let tick = 0; tick <= 120; tick++) {
+      const delta = deltas[tick];
+      assert.equal(delta.ok, true);
+      assert.equal(delta.tick, tick);
+      kin.apply(delta.colliderFrames);
+      sim.step();
+      sim.world.contactPair(sim.body(platformId).collider(0), sim.body(ballId).collider(0), (manifold) => {
+        contacts += manifold.numSolverContacts();
+      });
+      snapshots.push(sim.takeSnapshot());
+    }
+    assert.ok(contacts > 0, "the dynamic ball contacts the moving platform");
+    assert.notEqual(sim.body(ballId).translation().x, 1, "contact transfers platform motion to the ball");
+    // Invalidate the live map, including recreation, before restoring its old identity.
+    kin.apply([]);
+    kin.apply(deltas[120].colliderFrames);
+    assert.notEqual(kin.bodyOf(initial.key), platformId);
+    sim.restoreSnapshot(snapshots[60]);
+    assert.equal(kin.bodyOf(initial.key), platformId);
+    for (let tick = 61; tick <= 120; tick++) {
+      const replay = deltas[121 + tick - 61];
+      assert.equal(replay.ok, true);
+      assert.equal(replay.tick, tick);
+      assert.deepEqual(replay.colliderFrames, deltas[tick].colliderFrames);
+      kin.apply(replay.colliderFrames);
+      sim.step();
+      assert.deepEqual(sim.takeSnapshot(), snapshots[tick], `snapshot bytes at tick ${tick}`);
+    }
+    kin.apply([]);
+    sim.restoreSnapshot(snapshots[60]);
+    kin.dispose();
+    assert.equal(sim.hasBody(platformId), false, "dispose also reconciles restored bodies");
+    assert.equal(sim.hasBody(ballId), true);
+  } finally {
+    kin.dispose();
+    sim.free();
+  }
 });
