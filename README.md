@@ -227,6 +227,6 @@ Version 0.2.0 of both packages: early, not published, not battle-tested outside 
 
 ## License
 
-ETCITO LICENSE v1.0 (source-available, 1% royalty above USD 100,000 per Product, "Powered by Etcito" splash credit), copyright 2026 Etcito SAS. See [`LICENSE`](LICENSE). The Rapier adapter uses
+ETCITO LICENSE v1.1 (source-available; per Product that uses the code: 1% of its revenue above USD 100,000 plus 1% of its AI spend above USD 10,000; "Powered by Etcito" splash credit), copyright 2026 Etcito SAS. See [`LICENSE`](LICENSE). The Rapier adapter uses
 `@dimforge/rapier3d-deterministic-compat` (Apache-2.0, Dimforge) as a peer dependency and credits ideas from Sketchbook (MIT); see
 `packages/rapier/NOTICE`.

@@ -1,6 +1,6 @@
 # ETCITO LICENSE
 
-**Version 1.0 — DRAFT — 2026-11-11**
+**Version 1.1 — DRAFT — 2026-11-14**
 
 Copyright (c) 2026 Etcito SAS. All rights reserved except as expressly granted below.
 
@@ -37,6 +37,8 @@ Example Content and third-party material described in Section 8 are excluded fro
 
 **"Gross Revenue"** means worldwide revenue directly attributable to a covered Product, calculated under Section 5 before deduction of platform commissions, publisher shares, payment-processing charges, development costs, or other business expenses.
 
+**"AI Spend"** means the amounts You, or anyone acting on Your behalf, pay or incur for artificial-intelligence services and compute used to design, develop, produce, test, operate, or provide a covered Product, calculated under Section 5.8.
+
 ## 3. LICENSE GRANT AND PRODUCT DISTRIBUTION
 
 Subject to this License, Etcito grants You a non-exclusive, worldwide license to use, copy, study, modify, and build the Software, and to Distribute Products containing it. This grant continues for the duration of the applicable intellectual property rights unless terminated under Section 11.
@@ -51,21 +53,26 @@ You may engage publishers and distributors to distribute the Product on Your beh
 
 ## 4. ROYALTY-FREE USE
 
-Personal use, study, teaching, research, experimentation, and internal use are royalty-free when they generate no Gross Revenue under Section 5. A Product with no Gross Revenue owes no royalty, including a Product released free of charge.
+Personal use, study, teaching, research, experimentation, and internal use that are not directed at a Product are royalty-free. A Product with neither Gross Revenue nor AI Spend owes no royalty, including a Product released free of charge.
 
-A Product's first USD 100,000 of cumulative Gross Revenue is also royalty-free. No periodic revenue report is required before a royalty becomes due.
+A Product's first USD 100,000 of cumulative Gross Revenue and its first USD 10,000 of cumulative AI Spend are also royalty-free. No periodic report is required before a royalty becomes due.
 
-Royalty-free use remains subject to this License, including the attribution requirements in Section 6 and the restrictions in Section 7. A free Product funded by advertising or other attributable revenue is not a zero-revenue Product.
+Royalty-free use remains subject to this License, including the attribution requirements in Section 6 and the restrictions in Section 7. A free Product funded by advertising or other attributable revenue is not a zero-revenue Product, and a Product without revenue still owes the AI Spend royalty of Section 5.
 
 ## 5. COMMERCIAL USE AND ROYALTIES
 
 ### 5.1. Rate, allowance, and no stacking
 
-For each Product, the first **USD 100,000** of cumulative Gross Revenue is exempt. You owe **1% of Gross Revenue above that amount**. The allowance applies once over the Product's lifetime, not once per year.
+For each Product, the royalty is the sum of two parts:
 
-The 1% royalty and USD 100,000 allowance apply once in total to a Product, regardless of how many Etcito libraries, components, packages, or repositories covered by this License it uses. Royalties paid under this License for the same Product and revenue count toward this single obligation.
+1. **1% of the Product's Gross Revenue** above the first **USD 100,000** of cumulative Gross Revenue; and
+2. **1% of the Product's AI Spend** above the first **USD 10,000** of cumulative AI Spend.
 
-For example, USD 150,000 of cumulative Gross Revenue produces USD 500 of cumulative royalties; USD 1,000,000 produces USD 9,000.
+Both parts are owed independently: a Product with no Gross Revenue still owes the AI Spend part, and the reverse. Only the Gross Revenue and the AI Spend of the Product that uses the Software are counted, never Your other products or Your business as a whole. Each allowance applies once over the Product's lifetime, not once per year.
+
+The two rates and allowances apply once in total to a Product, regardless of how many Etcito libraries, components, packages, or repositories covered by this License it uses. Royalties paid under this License for the same Product, revenue, and spend count toward this single obligation.
+
+For example, a Product with no Gross Revenue and USD 510,000 of cumulative AI Spend produces USD 5,000 of cumulative royalties; USD 1,000,000 of cumulative Gross Revenue and USD 210,000 of cumulative AI Spend produce USD 9,000 + USD 2,000 = USD 11,000.
 
 ### 5.2. Revenue included
 
@@ -97,9 +104,9 @@ Ports, platform releases, editions, updates, renamings, and substantially equiva
 
 ### 5.5. Quarterly calculation and payment
 
-Within **30 days after the end of each calendar quarter** in which a royalty becomes payable, send Etcito a statement identifying the Product, the quarter's Gross Revenue, relevant exclusions and adjustments, cumulative Gross Revenue, and the royalty due, and pay that royalty.
+Within **30 days after the end of each calendar quarter** in which a royalty becomes payable, send Etcito a statement identifying the Product, the quarter's Gross Revenue and AI Spend, relevant exclusions and adjustments, cumulative Gross Revenue, cumulative AI Spend, and the royalty due, and pay that royalty.
 
-Calculate the cumulative royalty as 1% of the positive amount by which cumulative Gross Revenue exceeds USD 100,000. Subtract royalties already paid for that Product and pay the remaining positive balance. Later refunds, chargebacks, or corrections reduce the cumulative calculation; any resulting overpayment is credited against future royalties for that Product.
+Calculate the cumulative royalty as 1% of the positive amount by which cumulative Gross Revenue exceeds USD 100,000, plus 1% of the positive amount by which cumulative AI Spend exceeds USD 10,000. Subtract royalties already paid for that Product and pay the remaining positive balance. Later refunds, chargebacks, or corrections reduce the cumulative calculation; any resulting overpayment is credited against future royalties for that Product.
 
 Amounts are calculated in US dollars. Convert other currencies using a consistently applied published exchange rate for the receipt date or a published average for the receipt month, and identify the source in the statement. Payments are in US dollars unless Etcito agrees otherwise in writing. Etcito supplies payment instructions through the contact in Section 1. Taxes legally chargeable on Etcito's royalty invoice, if any, are additional to the royalty amount.
 
@@ -110,6 +117,21 @@ Keep records reasonably sufficient to support Your reports for three years after
 ### 5.7. Etcito's own products
 
 Etcito's own Products are exempt from the royalty obligation in this section. This exemption does not change any third-party license or obligation.
+
+### 5.8. AI Spend
+
+AI Spend includes amounts paid or incurred, by You or by a publisher, contractor, affiliate, or other party acting for the Product, for:
+
+1. usage of artificial-intelligence models billed by tokens, requests, credits, seats, or time, including text, code, image, audio, video, and 3D generation and AI agents;
+2. subscriptions to AI assistants, AI coding tools, and AI generation tools, for the share used for the Product;
+3. training, fine-tuning, or evaluating models for the Product; and
+4. compute rented, or the documented running cost of owned hardware, used to run or train AI models for the Product, including inference served to the Product's end users.
+
+AI Spend excludes salaries and fees for human work, compute and services that run no AI model, taxes collected for a public authority, amounts refunded to You, usage received free of charge, and amounts paid to Etcito. Count the same spend only once.
+
+When a subscription, an account, or hardware serves several products or purposes, allocate its cost reasonably and consistently to the covered Product using a documented method. Transfers between related entities must not artificially reduce the AI Spend attributable to a Product.
+
+AI Spend incurred exclusively before the Product first used the Software, or exclusively for versions or operations that no longer contain, execute, or depend on any covered Software code, is excluded and does not consume the allowance. The continuity and grouping rules of Section 5.4 apply to AI Spend and its allowance as they do to Gross Revenue.
 
 ## 6. REQUIRED ATTRIBUTION
 
